@@ -10,6 +10,7 @@ use sha2::Digest;
 
 #[derive(Debug)]
 pub enum LogFsError {
+    NotFound { path: Path },
     Internal { message: String },
     Io(std::io::Error),
     Conversion(bincode::Error),
@@ -31,6 +32,9 @@ impl std::fmt::Display for LogFsError {
             }
             LogFsError::Io(err) => err.fmt(f),
             LogFsError::Conversion(err) => err.fmt(f),
+            LogFsError::NotFound { path } => {
+                write!(f, "File not found: {:?}", path)
+            }
         }
     }
 }
@@ -41,6 +45,7 @@ impl std::error::Error for LogFsError {
             LogFsError::Internal { .. } => None,
             LogFsError::Io(err) => Some(err),
             LogFsError::Conversion(err) => Some(err),
+            LogFsError::NotFound { path: _ } => None,
         }
     }
 }
@@ -66,24 +71,35 @@ struct FileNode {
     hash: Vec<u8>,
 }
 
+/// A file action in the log/journal.
+///
+/// Actions are written to files in a (de)serialized encoding.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[repr(u32)]
 enum JournalAction {
     FileCreated(FileNode),
     FilesDeleted { paths: Vec<Path> },
+    FileRenamed { old_path: Path, new_path: Path },
 }
 
+/// A single entry in the log/journal.
+///
+/// Entries are written to files in a serialized encoding.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct JournalEntry {
     sequence_id: u64,
     action: JournalAction,
 }
 
+/// The header data prefixed to each log entry.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct JournalEntryHeader {
     size: u32,
 }
 
+/// A node pointer stores the file offset to a particular file.
+///
+/// Only used at runtime.
 #[derive(Clone, Debug)]
 struct NodePointer {
     sequence_id: u64,
@@ -95,13 +111,19 @@ struct State {
     tree: BTreeMap<Path, NodePointer>,
     next_sequence: u64,
     file: std::io::BufWriter<std::fs::File>,
+
+    /// Amount of bytes of redundant (deleted) file data that could be removed
+    /// by re-writing the log.
+    /// Does not include the space taken up by journal log messages, only the
+    /// aggregated file size.
+    redundant_data_bytes_estimate: u128,
 }
 
 impl State {
-    fn increment_sequence(&mut self) -> u64 {
-        let seq = self.next_sequence;
+    /// Compute the sequence
+    fn next_sequence(&mut self) -> u64 {
         self.next_sequence += 1;
-        seq
+        self.next_sequence
     }
 }
 
@@ -148,6 +170,7 @@ impl LogFs {
         let mut tree: BTreeMap<Path, NodePointer> = Default::default();
         let mut next_sequence = 1;
         let file_len = meta.len();
+        let mut freeable_data_size: u128 = 0;
 
         let mut buffer = Vec::new();
         loop {
@@ -175,7 +198,17 @@ impl LogFs {
                 }
                 JournalAction::FilesDeleted { paths } => {
                     for path in &paths {
-                        tree.remove(path);
+                        if let Some(node) = tree.remove(path) {
+                            // NOTE: does not respect overflow, but u128 is huge,
+                            // and even if it overflows: this is only for information/
+                            // statistics purposes, so an invalid value is not a problem.
+                            freeable_data_size += node.size as u128;
+                        }
+                    }
+                }
+                JournalAction::FileRenamed { old_path, new_path } => {
+                    if let Some(old) = tree.remove(&old_path) {
+                        tree.insert(new_path, old);
                     }
                 }
             }
@@ -194,6 +227,7 @@ impl LogFs {
                 tree,
                 next_sequence,
                 file,
+                redundant_data_bytes_estimate: freeable_data_size,
             })),
         })
     }
@@ -266,12 +300,18 @@ impl LogFs {
         Ok(())
     }
 
+    /// Returns the approximate amount of bytes that could be saved when
+    /// re-writing the log.
+    pub fn redundant_data_estimate(&self) -> u128 {
+        self.state.read().unwrap().redundant_data_bytes_estimate
+    }
+
     pub fn insert(&self, path: impl Into<Vec<u8>>, mut data: Vec<u8>) -> Result<(), LogFsError> {
         let hash = sha2::Sha256::digest(&data);
 
         let path = path.into();
         let mut state = self.state.write().unwrap();
-        let sequence_id = state.increment_sequence();
+        let sequence_id = state.next_sequence();
         let data_len = data.len() as u64;
 
         let entry = JournalEntry {
@@ -282,6 +322,7 @@ impl LogFs {
                 hash: hash.to_vec(),
             }),
         };
+        // FIXME: implement resilient write.
         Self::write_entry(&self.key, &mut state, entry)?;
 
         let data_nonce = Self::build_data_nonce(sequence_id);
@@ -306,13 +347,26 @@ impl LogFs {
         Ok(())
     }
 
-    pub fn rename(&self, from: &[u8], to: impl Into<Vec<u8>>) -> Result<(), LogFsError> {
-        // FIXME: make this (semi)atomic with a lock! Just a stub helper for now.
-        let data = self
-            .get(from)?
-            .ok_or_else(|| LogFsError::new("Path not found"))?;
-        self.insert(to, data)?;
-        self.remove(from)?;
+    pub fn rename(&self, from: &[u8], target_path: impl Into<Vec<u8>>) -> Result<(), LogFsError> {
+        let target_path = target_path.into();
+
+        let mut state = self.state.write().unwrap();
+
+        // FIXME: implement resilient write.
+        let node = state
+            .tree
+            .remove(from)
+            .ok_or_else(|| LogFsError::NotFound { path: from.into() })?;
+
+        let entry = JournalEntry {
+            sequence_id: state.next_sequence(),
+            action: JournalAction::FileRenamed {
+                old_path: from.into(),
+                new_path: target_path.clone(),
+            },
+        };
+        Self::write_entry(&self.key, &mut state, entry)?;
+        state.tree.insert(target_path, node);
 
         Ok(())
     }
@@ -379,7 +433,7 @@ impl LogFs {
 
         let mut state = self.state.write().unwrap();
 
-        let sequence_id = state.increment_sequence();
+        let sequence_id = state.next_sequence();
         let entry = JournalEntry {
             sequence_id,
             action: JournalAction::FilesDeleted {
@@ -397,7 +451,7 @@ impl LogFs {
 
         let mut state = self.state.write().unwrap();
 
-        let sequence_id = state.increment_sequence();
+        let sequence_id = state.next_sequence();
         let entry = JournalEntry {
             sequence_id,
             action: JournalAction::FilesDeleted { paths },
