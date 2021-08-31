@@ -347,4 +347,9 @@ impl Journal {
         }
         Ok(buffer)
     }
+
+    /// Get a reference to the journal's path.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
 }

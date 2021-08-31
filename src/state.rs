@@ -18,7 +18,7 @@ pub struct KeyPointer {
 
 /// Runtime state of the db.
 pub struct State {
-    /// A tree mapping paths to key metadata.
+    /// A tree mapping keys to key metadata.
     /// This allows quickly finding keys and their file system location.
     ///
     /// NOTE: all paths are kept in memory, which increases memory usage but
