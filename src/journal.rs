@@ -65,6 +65,8 @@ struct JournalState {
     sequence: u64,
 }
 
+// TODO: investigate mmap instead of regular files.
+// Due to the append-only nature, mmap would be relatively straight forward.
 pub struct Journal {
     path: std::path::PathBuf,
     state: std::sync::Mutex<JournalState>,
@@ -242,6 +244,8 @@ impl Journal {
             None
         };
 
+        let current_offset = writer.stream_position()?;
+
         let res = Self::try_write_entry(
             writer,
             &header_data,
@@ -250,18 +254,48 @@ impl Journal {
         );
         let data_offset = match res {
             Ok(d) => d,
-            Err(_err) => {
+            Err(err) => {
                 // An error ocurred during writing.
                 // No information exists on how much was written.
                 // BufWriter does not yet offer a good way to retrieve the
-                // underlying file, so for now we just taint the journal.
-                // FIXME: do smarter error recovery.
-                state.writer = None;
-                return Err(LogFsError::Tainted);
+                // underlying file, so we do a cumbersome workaround of
+                // constructing a new file and truncate to the last known
+                // offset.
+                let new_length = if current_offset > 0 {
+                    current_offset - 1
+                } else {
+                    0
+                };
+                match Self::open_and_truncate_file(&self.path, new_length) {
+                    Ok(new_file) => {
+                        state.writer = Some(std::io::BufWriter::new(new_file));
+                        return Err(err.into());
+                    }
+                    Err(_err) => {
+                        // Truncation failed.
+                        // We can't recover, so taint the journal and make it
+                        // unusable for writes until a database restart.
+                        state.writer = None;
+                        return Err(LogFsError::Tainted);
+                    }
+                }
             }
         };
         state.sequence = next_sequence;
         Ok((entry, data_offset))
+    }
+
+    fn open_and_truncate_file(
+        path: &std::path::Path,
+        new_length: u64,
+    ) -> Result<std::fs::File, std::io::Error> {
+        let f = std::fs::OpenOptions::new()
+            .create(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        f.set_len(new_length)?;
+        Ok(f)
     }
 
     fn try_write_entry(
@@ -330,6 +364,7 @@ impl Journal {
         crypto_opt: Option<&Crypto>,
         pointer: &KeyPointer,
     ) -> Result<Vec<u8>, LogFsError> {
+        // TODO: use a pool of reused file descriptors
         let mut f = std::fs::File::open(&self.path)?;
         f.seek(std::io::SeekFrom::Start(pointer.offset))?;
         let mut reader = std::io::BufReader::new(f);

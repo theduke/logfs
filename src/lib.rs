@@ -207,7 +207,6 @@ mod tests {
         log.insert(key1, content1.clone()).unwrap();
         assert_eq!(log.get(key1).unwrap(), Some(content1.clone()));
 
-
         log.insert(key2, content2.clone()).unwrap();
         assert_eq!(log.get(key2).unwrap(), Some(content2.clone()));
 
@@ -226,9 +225,7 @@ mod tests {
         assert_eq!(log2.get(key3_a).unwrap(), None);
         assert_eq!(&log2.get(key3_b).unwrap().unwrap(), &content3);
 
-
         std::mem::drop(log2);
-
 
         let log3 = LogFs::open(&path, TEST_PW.into()).unwrap();
         assert_eq!(log3.get(key1).unwrap(), None);
