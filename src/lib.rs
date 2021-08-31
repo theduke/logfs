@@ -1,463 +1,156 @@
+mod error;
+pub use self::error::LogFsError;
+
+mod state;
+
+mod journal;
+
+mod crypto;
+
 use std::{
-    collections::BTreeMap,
-    io::{Read, Seek, Write},
     path::PathBuf,
     sync::{Arc, RwLock},
 };
 
-use ring::{aead, digest::SHA256_OUTPUT_LEN};
-use sha2::Digest;
-
-#[derive(Debug)]
-pub enum LogFsError {
-    NotFound { path: Path },
-    Internal { message: String },
-    Io(std::io::Error),
-    Conversion(bincode::Error),
-}
-
-impl LogFsError {
-    fn new(msg: impl Into<String>) -> Self {
-        Self::Internal {
-            message: msg.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for LogFsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogFsError::Internal { message } => {
-                write!(f, "{}", message)
-            }
-            LogFsError::Io(err) => err.fmt(f),
-            LogFsError::Conversion(err) => err.fmt(f),
-            LogFsError::NotFound { path } => {
-                write!(f, "File not found: {:?}", path)
-            }
-        }
-    }
-}
-
-impl std::error::Error for LogFsError {
-    fn cause(&self) -> Option<&dyn std::error::Error> {
-        match self {
-            LogFsError::Internal { .. } => None,
-            LogFsError::Io(err) => Some(err),
-            LogFsError::Conversion(err) => Some(err),
-            LogFsError::NotFound { path: _ } => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for LogFsError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<bincode::Error> for LogFsError {
-    fn from(err: bincode::Error) -> Self {
-        Self::Conversion(err)
-    }
-}
-
 type Path = Vec<u8>;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct FileNode {
-    path: Path,
-    data_len: u64,
-    hash: Vec<u8>,
-}
-
-/// A file action in the log/journal.
-///
-/// Actions are written to files in a (de)serialized encoding.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[repr(u32)]
-enum JournalAction {
-    FileCreated(FileNode),
-    FilesDeleted { paths: Vec<Path> },
-    FileRenamed { old_path: Path, new_path: Path },
-}
-
-/// A single entry in the log/journal.
-///
-/// Entries are written to files in a serialized encoding.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct JournalEntry {
-    sequence_id: u64,
-    action: JournalAction,
-}
-
-/// The header data prefixed to each log entry.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct JournalEntryHeader {
-    size: u32,
-}
-
-/// A node pointer stores the file offset to a particular file.
-///
-/// Only used at runtime.
-#[derive(Clone, Debug)]
-struct NodePointer {
-    sequence_id: u64,
-    offset: u64,
-    size: u64,
-}
-
-struct State {
-    tree: BTreeMap<Path, NodePointer>,
-    next_sequence: u64,
-    file: std::io::BufWriter<std::fs::File>,
-
-    /// Amount of bytes of redundant (deleted) file data that could be removed
-    /// by re-writing the log.
-    /// Does not include the space taken up by journal log messages, only the
-    /// aggregated file size.
-    redundant_data_bytes_estimate: u128,
-}
-
-impl State {
-    /// Compute the sequence
-    fn next_sequence(&mut self) -> u64 {
-        self.next_sequence += 1;
-        self.next_sequence
-    }
-}
 
 #[derive(Clone)]
 pub struct LogFs {
-    path: std::path::PathBuf,
-    key: Arc<aead::LessSafeKey>,
-    state: Arc<RwLock<State>>,
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    crypto: Option<crypto::Crypto>,
+    state: RwLock<state::State>,
+    journal: journal::Journal,
 }
 
 type DataOffset = u64;
 
 impl LogFs {
+    // TODO: add open() without key and open_encrypted() with key.
     pub fn open(path: impl Into<PathBuf>, key: String) -> Result<Self, LogFsError> {
-        let mut derived_key = [0u8; SHA256_OUTPUT_LEN];
-        ring::pbkdf2::derive(
-            ring::pbkdf2::PBKDF2_HMAC_SHA512,
-            std::num::NonZeroU32::new(100_000).unwrap(),
-            b"0000",
-            key.as_bytes(),
-            &mut derived_key,
-        );
-
-        let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &derived_key)
-            .map_err(|_| LogFsError::new("Invalid key"))?;
-        let aead_key = aead::LessSafeKey::new(unbound_key);
-
-        let path = path.into();
-        if let Some(parent) = path.parent() {
-            if !parent.is_dir() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        let meta = f.metadata()?;
-
-        let mut filebuf = std::io::BufReader::new(f);
-
-        let mut tree: BTreeMap<Path, NodePointer> = Default::default();
-        let mut next_sequence = 1;
-        let file_len = meta.len();
-        let mut freeable_data_size: u128 = 0;
-
-        let mut buffer = Vec::new();
-        loop {
-            let offset = filebuf.stream_position()?;
-            if offset >= file_len {
-                break;
-            }
-
-            let (entry, data_offset) =
-                Self::read_journal_entry(next_sequence, &mut filebuf, &mut buffer, &aead_key)?;
-            match entry.action {
-                JournalAction::FileCreated(f) => {
-                    tree.insert(
-                        f.path,
-                        NodePointer {
-                            sequence_id: entry.sequence_id,
-                            offset: offset + data_offset,
-                            size: f.data_len,
-                        },
-                    );
-                    // Skip data.
-                    filebuf.seek(std::io::SeekFrom::Current(
-                        f.data_len as i64 + aead::CHACHA20_POLY1305.tag_len() as i64,
-                    ))?;
-                }
-                JournalAction::FilesDeleted { paths } => {
-                    for path in &paths {
-                        if let Some(node) = tree.remove(path) {
-                            // NOTE: does not respect overflow, but u128 is huge,
-                            // and even if it overflows: this is only for information/
-                            // statistics purposes, so an invalid value is not a problem.
-                            freeable_data_size += node.size as u128;
-                        }
-                    }
-                }
-                JournalAction::FileRenamed { old_path, new_path } => {
-                    if let Some(old) = tree.remove(&old_path) {
-                        tree.insert(new_path, old);
-                    }
-                }
-            }
-
-            next_sequence += 1;
-        }
-
-        assert_eq!(filebuf.buffer().len(), 0, "file buffer is empty");
-
-        let file = std::io::BufWriter::new(filebuf.into_inner());
+        let crypto = Some(crypto::Crypto::new(key));
+        let mut state = state::State::new();
+        let journal = journal::Journal::open(path.into(), &mut state, crypto.as_ref())?;
 
         Ok(Self {
-            path,
-            key: Arc::new(aead_key),
-            state: Arc::new(RwLock::new(State {
-                tree,
-                next_sequence,
-                file,
-                redundant_data_bytes_estimate: freeable_data_size,
-            })),
+            inner: Arc::new(Inner {
+                crypto,
+                state: RwLock::new(state),
+                journal,
+            }),
         })
-    }
-
-    fn read_journal_entry(
-        sequence: u64,
-        reader: &mut impl std::io::Read,
-        mut buffer: &mut Vec<u8>,
-        key: &aead::LessSafeKey,
-    ) -> Result<(JournalEntry, DataOffset), LogFsError> {
-        let mut header_data = [0u8; std::mem::size_of::<JournalEntryHeader>()];
-        // Read journal entry header with size.
-        reader.read_exact(&mut header_data)?;
-        let header: JournalEntryHeader = bincode::deserialize(&header_data)?;
-
-        // Read the journal entry.
-        buffer.resize(header.size as usize, 0);
-        reader.read_exact(buffer)?;
-
-        // Decrypt.
-        let nonce = Self::build_entry_nonce(sequence);
-
-        let aad = aead::Aad::from(header_data);
-
-        let entry_data = key
-            .open_in_place(nonce, aad, &mut buffer)
-            .map_err(|_| LogFsError::new("Could not decrypt journal entry"))?;
-
-        let entry: JournalEntry = bincode::deserialize(&entry_data)?;
-
-        assert_eq!(sequence, entry.sequence_id);
-        let data_offset = (header.size as usize + std::mem::size_of::<JournalEntryHeader>()) as u64;
-        Ok((entry, data_offset))
-    }
-
-    fn build_entry_nonce(sequence: u64) -> aead::Nonce {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..8].copy_from_slice(&sequence.to_le_bytes());
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
-        nonce
-    }
-
-    fn build_data_nonce(sequence: u64) -> aead::Nonce {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..8].copy_from_slice(&sequence.to_le_bytes());
-        nonce_bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
-        nonce
-    }
-
-    fn write_entry(
-        key: &aead::LessSafeKey,
-        state: &mut State,
-        entry: JournalEntry,
-    ) -> Result<(), LogFsError> {
-        let mut entry_data = bincode::serialize(&entry)?;
-
-        let header = JournalEntryHeader {
-            size: (entry_data.len() + aead::CHACHA20_POLY1305.tag_len()) as u32,
-        };
-        let header_data = bincode::serialize(&header)?;
-
-        let nonce = Self::build_entry_nonce(entry.sequence_id);
-        let aad = aead::Aad::from(&header_data);
-        key.seal_in_place_append_tag(nonce, aad, &mut entry_data)
-            .map_err(|_| LogFsError::new("Could not encrypt journal entry"))?;
-
-        state.file.write_all(&header_data)?;
-        state.file.write_all(&entry_data)?;
-        Ok(())
     }
 
     /// Returns the approximate amount of bytes that could be saved when
     /// re-writing the log.
     pub fn redundant_data_estimate(&self) -> u128 {
-        self.state.read().unwrap().redundant_data_bytes_estimate
+        self.inner
+            .state
+            .read()
+            .unwrap()
+            .redundant_data_bytes_estimate()
     }
 
-    pub fn insert(&self, path: impl Into<Vec<u8>>, mut data: Vec<u8>) -> Result<(), LogFsError> {
-        let hash = sha2::Sha256::digest(&data);
-
+    pub fn insert(&self, path: impl Into<Vec<u8>>, data: Vec<u8>) -> Result<(), LogFsError> {
         let path = path.into();
-        let mut state = self.state.write().unwrap();
-        let sequence_id = state.next_sequence();
-        let data_len = data.len() as u64;
-
-        let entry = JournalEntry {
-            sequence_id,
-            action: JournalAction::FileCreated(FileNode {
-                path: path.clone(),
-                data_len,
-                hash: hash.to_vec(),
-            }),
-        };
-        // FIXME: implement resilient write.
-        Self::write_entry(&self.key, &mut state, entry)?;
-
-        let data_nonce = Self::build_data_nonce(sequence_id);
-        let aad = aead::Aad::from(&[]);
-        self.key
-            .seal_in_place_append_tag(data_nonce, aad, &mut data)
-            .map_err(|_| LogFsError::new("Could not encrypt journal entry"))?;
-
-        let data_offset = state.file.stream_position()?;
-        state.file.write_all(&data)?;
-        state.file.flush()?;
-
-        state.tree.insert(
-            path,
-            NodePointer {
-                sequence_id,
-                size: data_len,
-                offset: data_offset as u64,
-            },
-        );
-
+        let mut state = self.inner.state.write().unwrap();
+        let pointer =
+            self.inner
+                .journal
+                .write_insert(self.inner.crypto.as_ref(), path.clone(), data)?;
+        state.add_key(path, pointer);
         Ok(())
     }
 
-    pub fn rename(&self, from: &[u8], target_path: impl Into<Vec<u8>>) -> Result<(), LogFsError> {
-        let target_path = target_path.into();
+    pub fn rename(
+        &self,
+        old_key: impl Into<Vec<u8>>,
+        new_key: impl Into<Vec<u8>>,
+    ) -> Result<(), LogFsError> {
+        let old_key = old_key.into();
+        let new_key = new_key.into();
+        let mut state = self.inner.state.write().unwrap();
 
-        let mut state = self.state.write().unwrap();
+        // Ensure key exists.
+        if state.get_key(&old_key).is_none() {
+            return Err(LogFsError::NotFound {
+                path: old_key.into(),
+            });
+        }
 
-        // FIXME: implement resilient write.
-        let node = state
-            .tree
-            .remove(from)
-            .ok_or_else(|| LogFsError::NotFound { path: from.into() })?;
+        self.inner.journal.write_rename(
+            self.inner.crypto.as_ref(),
+            old_key.to_vec(),
+            new_key.clone(),
+        )?;
 
-        let entry = JournalEntry {
-            sequence_id: state.next_sequence(),
-            action: JournalAction::FileRenamed {
-                old_path: from.into(),
-                new_path: target_path.clone(),
-            },
-        };
-        Self::write_entry(&self.key, &mut state, entry)?;
-        state.tree.insert(target_path, node);
+        // NOTE: unwrap can't fail, since key existence was checked above.
+        state.rename_key(&old_key, new_key).unwrap();
 
         Ok(())
     }
 
     pub fn get(&self, path: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, LogFsError> {
-        let pointer = match self.state.read().unwrap().tree.get(path.as_ref()).cloned() {
-            Some(data) => data,
+        let pointer = match self
+            .inner
+            .state
+            .read()
+            .unwrap()
+            .get_key(path.as_ref())
+            .cloned()
+        {
+            Some(pointer) => pointer,
             None => {
                 return Ok(None);
             }
         };
-
-        let mut f = std::fs::File::open(&self.path)?;
-        f.seek(std::io::SeekFrom::Start(pointer.offset))?;
-        let mut reader = std::io::BufReader::new(f);
-
-        let mut buffer = Vec::new();
-        let data_plus_tag_len = pointer.size as usize + aead::CHACHA20_POLY1305.tag_len();
-        buffer.resize(data_plus_tag_len, 0);
-        reader.read_exact(&mut buffer)?;
-
-        let nonce = Self::build_data_nonce(pointer.sequence_id);
         let data = self
-            .key
-            .open_in_place(nonce, aead::Aad::from(&[]), &mut buffer)
-            .map_err(|_| LogFsError::new("Could not decrypt data"))?;
-
-        // FIXME: use original buffer.
-        Ok(Some(data.to_vec()))
+            .inner
+            .journal
+            .read_data(self.inner.crypto.as_ref(), &pointer)?;
+        Ok(Some(data))
     }
 
     pub fn paths_range<R>(&self, range: R) -> Result<Vec<Path>, LogFsError>
     where
         R: std::ops::RangeBounds<Vec<u8>>,
     {
-        let paths = self
-            .state
-            .read()
-            .unwrap()
-            .tree
-            .range(range)
-            .map(|x| x.0)
-            .cloned()
-            .collect();
-        Ok(paths)
+        Ok(self.inner.state.read().unwrap().paths_range(range))
     }
 
     pub fn paths_prefix(&self, prefix: &[u8]) -> Result<Vec<Path>, LogFsError> {
-        let paths = self
-            .state
-            .read()
-            .unwrap()
-            .tree
-            .range(prefix.to_vec()..)
-            .take_while(|(path, _v)| path.starts_with(prefix))
-            .map(|x| x.0)
-            .cloned()
-            .collect();
-        Ok(paths)
+        Ok(self.inner.state.read().unwrap().paths_prefix(prefix))
     }
 
     pub fn remove(&self, path: impl AsRef<[u8]>) -> Result<(), LogFsError> {
         let path = path.as_ref();
 
-        let mut state = self.state.write().unwrap();
+        let mut state = self.inner.state.write().unwrap();
 
-        let sequence_id = state.next_sequence();
-        let entry = JournalEntry {
-            sequence_id,
-            action: JournalAction::FilesDeleted {
-                paths: vec![path.into()],
-            },
-        };
-        Self::write_entry(&self.key, &mut state, entry)?;
-        state.file.flush()?;
+        if let Some(_pointer) = state.remove_key(path) {
+            self.inner
+                .journal
+                .write_remove(self.inner.crypto.as_ref(), vec![path.to_vec()])?;
+        }
 
         Ok(())
     }
 
     pub fn remove_prefix(&self, prefix: impl AsRef<[u8]>) -> Result<(), LogFsError> {
-        let paths = self.paths_prefix(prefix.as_ref())?;
+        let mut state = self.inner.state.write().unwrap();
+        let paths = state.paths_prefix(prefix.as_ref());
 
-        let mut state = self.state.write().unwrap();
+        if !paths.is_empty() {
+            self.inner
+                .journal
+                .write_remove(self.inner.crypto.as_ref(), paths.clone())?;
+        }
 
-        let sequence_id = state.next_sequence();
-        let entry = JournalEntry {
-            sequence_id,
-            action: JournalAction::FilesDeleted { paths },
-        };
-        Self::write_entry(&self.key, &mut state, entry)?;
-        state.file.flush()?;
+        for path in paths {
+            state.remove_key(&path);
+        }
 
         Ok(())
     }
