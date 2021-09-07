@@ -20,6 +20,9 @@ enum Subcommand {
         /// Use '-' for stdin.
         value: String,
     },
+    Delete {
+        key: String,
+    }
 }
 
 #[derive(StructOpt)]
@@ -76,6 +79,16 @@ fn run(opt: Options) -> Result<(), logfs::LogFsError> {
             } else {
                 db.insert(key, value.into_bytes())
             }
+        }
+        Subcommand::Delete { key } => {
+            if db.get(&key).is_ok() {
+                db.remove(&key)?;
+                eprintln!("Key '{}' deleted", key);
+            } else {
+                eprintln!("Error: Key '{}' does not exist", key);
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }
