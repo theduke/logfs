@@ -1,5 +1,4 @@
-use std::io::Read;
-use std::io::Write;
+use std::io::{Read, Write};
 
 use structopt::StructOpt;
 
@@ -22,7 +21,7 @@ enum Subcommand {
     },
     Delete {
         key: String,
-    }
+    },
 }
 
 #[derive(StructOpt)]
@@ -47,8 +46,7 @@ fn run(opt: Options) -> Result<(), logfs::LogFsError> {
     let db = logfs::LogFs::open(opt.path, opt.key)?;
 
     match opt.cmd {
-        Subcommand::List{ offset: _, max: _ } => {
-
+        Subcommand::List { offset: _, max: _ } => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
 
