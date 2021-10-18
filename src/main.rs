@@ -46,11 +46,11 @@ fn run(opt: Options) -> Result<(), logfs::LogFsError> {
     let db = logfs::LogFs::open(opt.path, opt.key)?;
 
     match opt.cmd {
-        Subcommand::List { offset: _, max: _ } => {
+        Subcommand::List { offset, max } => {
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
 
-            for path in db.paths_range(..)? {
+            for path in db.paths_offset(offset.unwrap_or_default(), max.unwrap_or(1000))? {
                 write!(&mut lock, "{}\n", pretty_value(&path)).unwrap();
             }
 

@@ -89,6 +89,11 @@ impl LogFs {
     }
 
     /// Get all paths with a given prefix.
+    pub fn paths_offset(&self, offset: usize, max: usize) -> Result<Vec<Path>, LogFsError> {
+        Ok(self.inner.state.read().unwrap().paths_offset(offset, max))
+    }
+
+    /// Get all paths with a given prefix.
     pub fn paths_prefix(&self, prefix: &[u8]) -> Result<Vec<Path>, LogFsError> {
         Ok(self.inner.state.read().unwrap().paths_prefix(prefix))
     }

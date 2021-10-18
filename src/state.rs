@@ -55,6 +55,16 @@ impl State {
         self.tree.range(range).map(|x| x.0).cloned().collect()
     }
 
+    pub fn paths_offset(&self, offset: usize, max: usize) -> Vec<Path> {
+        self.tree
+            .iter()
+            .skip(offset)
+            .take(max)
+            .map(|x| x.0)
+            .cloned()
+            .collect()
+    }
+
     pub fn paths_prefix(&self, prefix: &[u8]) -> Vec<Path> {
         self.tree
             .range(prefix.to_vec()..)
