@@ -1,22 +1,42 @@
+use std::num::NonZeroU32;
+
 use ring::aead;
 
 use crate::{journal::NextEntryOffset, DataOffset, LogFsError};
+
+#[derive(Clone)]
+pub struct CryptoConfig {
+    pub key: zeroize::Zeroizing<String>,
+    pub salt: zeroize::Zeroizing<Vec<u8>>,
+    pub iterations: NonZeroU32,
+}
+
+impl std::fmt::Debug for CryptoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptoConfig")
+            .field("key", &"*****")
+            .field("seed", &"*****")
+            .field("iterations", &"*****")
+            .finish()
+    }
+}
 
 pub struct Crypto {
     key: aead::LessSafeKey,
 }
 
 impl Crypto {
-    pub fn new(mut key: String) -> Self {
-        let key_len = key.len();
+    pub const EXTRA_PAYLOAD_LEN: usize = 16;
+
+    pub fn new(config: CryptoConfig) -> Self {
         // Derive a via pbkdf2 key derivation.
         let mut derived_key = [0u8; ring::digest::SHA256_OUTPUT_LEN];
 
         ring::pbkdf2::derive(
             ring::pbkdf2::PBKDF2_HMAC_SHA512,
-            std::num::NonZeroU32::new(100_000).unwrap(),
-            b"0000",
-            key.as_bytes(),
+            config.iterations,
+            config.salt.as_slice(),
+            config.key.as_bytes(),
             &mut derived_key,
         );
 
@@ -27,16 +47,6 @@ impl Crypto {
         let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &derived_key)
             .expect("Internal error: invalid key");
         let aead_key = aead::LessSafeKey::new(unbound_key);
-
-        // Overwrite the memory of the original key.
-        // TODO: is this sufficient? there are crates that do this for secrets!
-        // FIXME: don't use unsafe...
-        unsafe {
-            let raw = key.as_bytes_mut();
-            for index in 0..key_len {
-                raw[index] = b'0';
-            }
-        }
 
         Self { key: aead_key }
     }
@@ -55,9 +65,11 @@ impl Crypto {
     /// [`JournalEntry`].
     /// The chunk index must start at 1!.
     fn build_data_nonce(sequence: u64, chunk_index: u32) -> Result<aead::Nonce, LogFsError> {
-        if chunk_index < 1 {
-            return Err(LogFsError::new("Internal error: Invalid chunk index 0"));
-        }
+        // if chunk_index < 1 {
+        //     return Err(LogFsError::new_internal(
+        //         "Internal error: Invalid chunk index 0",
+        //     ));
+        // }
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[0..8].copy_from_slice(&sequence.to_le_bytes());
@@ -78,7 +90,7 @@ impl Crypto {
             .key
             .open_in_place(nonce, aad, buffer)
             .map(|x| &*x)
-            .map_err(|_| LogFsError::new("Could not decrypt journal entry"))?;
+            .map_err(|_| LogFsError::new_internal("Could not decrypt journal entry"))?;
         Ok((data, self.extra_payload_len() as usize))
     }
 
@@ -97,7 +109,7 @@ impl Crypto {
         let aad = aead::Aad::from(header_data);
         self.key
             .seal_in_place_append_tag(nonce, aad, data)
-            .map_err(|_| LogFsError::new("Could not encrypt journal entry"))?;
+            .map_err(|_| LogFsError::new_internal("Could not encrypt journal entry"))?;
         Ok(())
     }
 
@@ -111,7 +123,21 @@ impl Crypto {
         let aad = aead::Aad::from(&[]);
         self.key
             .seal_in_place_append_tag(data_nonce, aad, data)
-            .map_err(|_| LogFsError::new("Could not encrypt journal entry"))
+            .map_err(|_| LogFsError::new_internal("Could not encrypt journal entry"))
+    }
+
+    pub fn decrypt_data_ref<'a>(
+        &self,
+        sequence: u64,
+        chunk_index: u32,
+        data: &'a mut [u8],
+    ) -> Result<&'a [u8], LogFsError> {
+        let nonce = Self::build_data_nonce(sequence, chunk_index)?;
+        let slice = self
+            .key
+            .open_in_place(nonce, aead::Aad::from(&[]), data)
+            .map_err(|_| LogFsError::new_internal("Could not decrypt data"))?;
+        Ok(slice)
     }
 
     pub fn decrypt_data(
@@ -124,7 +150,7 @@ impl Crypto {
         let nonce = Self::build_data_nonce(sequence, chunk_index)?;
         self.key
             .open_in_place(nonce, aead::Aad::from(&[]), data.as_mut_slice())
-            .map_err(|_| LogFsError::new("Could not decrypt data"))?;
+            .map_err(|_| LogFsError::new_internal("Could not decrypt data"))?;
         // Need to truncate data to actual length without the tag.
         data.truncate(full_length - self.extra_payload_len() as usize);
         Ok(data)

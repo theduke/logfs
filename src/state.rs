@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::RwLock};
 
 use crate::LogFsError;
 
@@ -14,6 +14,7 @@ pub struct KeyPointer {
     pub sequence_id: u64,
     pub offset: DataOffset,
     pub size: u64,
+    pub chunk_size: Option<u32>,
 }
 
 /// Runtime state of the db.
@@ -27,7 +28,7 @@ pub struct State {
     /// The memory usage overhead is mitigated a bit by using a [`BTreeMap`],
     /// which means that keys with the same prefix only consume extra memory
     /// for the unique segments.
-    tree: BTreeMap<Path, KeyPointer>,
+    pub(crate) tree: BTreeMap<Path, KeyPointer>,
 
     /// Amount of bytes of redundant (deleted) file data that could be removed
     /// by re-writing the log.
@@ -35,6 +36,8 @@ pub struct State {
     /// aggregated file size.
     redundant_data_bytes_estimate: u128,
 }
+
+pub type SharedTree = std::sync::Arc<RwLock<State>>;
 
 impl State {
     pub fn new() -> Self {
@@ -44,13 +47,13 @@ impl State {
         }
     }
 
-    pub fn get_key(&self, path: &[u8]) -> Option<&KeyPointer> {
+    pub fn get_key(&self, path: &str) -> Option<&KeyPointer> {
         self.tree.get(path)
     }
 
     pub fn paths_range<R>(&self, range: R) -> Vec<Path>
     where
-        R: std::ops::RangeBounds<Vec<u8>>,
+        R: std::ops::RangeBounds<String>,
     {
         self.tree.range(range).map(|x| x.0).cloned().collect()
     }
@@ -65,9 +68,9 @@ impl State {
             .collect()
     }
 
-    pub fn paths_prefix(&self, prefix: &[u8]) -> Vec<Path> {
+    pub fn paths_prefix(&self, prefix: &str) -> Vec<Path> {
         self.tree
-            .range(prefix.to_vec()..)
+            .range(prefix.to_string()..)
             .take_while(|(path, _v)| path.starts_with(prefix))
             .map(|x| x.0)
             .cloned()
@@ -78,7 +81,7 @@ impl State {
         self.tree.insert(path, pointer);
     }
 
-    pub fn remove_key(&mut self, path: &[u8]) -> Option<KeyPointer> {
+    pub fn remove_key(&mut self, path: &str) -> Option<KeyPointer> {
         if let Some(pointer) = self.tree.remove(path) {
             self.redundant_data_bytes_estimate += pointer.size as u128;
             Some(pointer)

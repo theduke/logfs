@@ -1,4 +1,7 @@
 mod error;
+use journal::v2::{KeyChunkIter, StdKeyReader};
+pub use journal::{Journal2, JournalStore};
+
 pub use self::error::LogFsError;
 
 mod state;
@@ -6,38 +9,108 @@ mod state;
 mod journal;
 
 mod crypto;
+pub use crypto::CryptoConfig;
 
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
 };
 
-type Path = Vec<u8>;
+type Path = String;
 
-#[derive(Clone)]
-pub struct LogFs {
-    inner: Arc<Inner>,
+pub struct ConfigBuilder {
+    config: LogConfig,
 }
 
-struct Inner {
-    crypto: Option<crypto::Crypto>,
-    state: RwLock<state::State>,
-    journal: journal::Journal,
+const DEFAULT_CHUNK_SIZE: u32 = 4_000_000;
+
+impl ConfigBuilder {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            config: LogConfig {
+                path: path.into(),
+                allow_create: false,
+                raw_mode: false,
+                crypto: None,
+                default_chunk_size: DEFAULT_CHUNK_SIZE,
+            },
+        }
+    }
+
+    pub fn raw_mode(mut self) -> Self {
+        self.config.raw_mode = true;
+        self
+    }
+
+    pub fn allow_create(mut self) -> Self {
+        self.config.allow_create = true;
+        self
+    }
+
+    pub fn crypto(mut self, crypto: CryptoConfig) -> Self {
+        self.config.crypto = Some(crypto);
+        self
+    }
+
+    pub fn build(self) -> LogConfig {
+        self.config
+    }
+
+    pub fn open(self) -> Result<LogFs, LogFsError> {
+        LogFs::open(self.config)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LogConfig {
+    pub path: PathBuf,
+    pub raw_mode: bool,
+    pub allow_create: bool,
+    pub crypto: Option<crypto::CryptoConfig>,
+    /// Data is chunked into separate slices, which allows incrementally reading
+    /// large keys.
+    /// This setting specifies the size of chunks in bytes.
+    ///
+    /// Note that keys can also be created with a custom chunk size.
+    pub default_chunk_size: u32,
+}
+
+pub struct LogFs<J = journal::Journal2> {
+    inner: Arc<Inner<J>>,
+    path: PathBuf,
+}
+
+impl Clone for LogFs {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            path: self.path.clone(),
+        }
+    }
+}
+
+struct Inner<J> {
+    state: Arc<RwLock<state::State>>,
+    journal: J,
 }
 
 type DataOffset = u64;
 
-impl LogFs {
+impl<J: JournalStore> LogFs<J> {
     // TODO: add open() without key and open_encrypted() with key.
-    pub fn open(path: impl Into<PathBuf>, key: String) -> Result<Self, LogFsError> {
-        let crypto = Some(crypto::Crypto::new(key));
+    pub fn open(mut config: LogConfig) -> Result<Self, LogFsError> {
+        let crypto = config
+            .crypto
+            .take()
+            .map(|c| Arc::new(crypto::Crypto::new(c)));
         let mut state = state::State::new();
-        let journal = journal::Journal::open(path.into(), &mut state, crypto.as_ref())?;
+        let path = config.path.clone();
+        let journal = J::open(path.clone(), &mut state, crypto.clone(), &config)?;
 
         Ok(Self {
+            path,
             inner: Arc::new(Inner {
-                crypto,
-                state: RwLock::new(state),
+                state: Arc::new(RwLock::new(state)),
                 journal,
             }),
         })
@@ -45,7 +118,7 @@ impl LogFs {
 
     /// Get the file system path.
     pub fn path(&self) -> std::path::PathBuf {
-        self.inner.journal.path().to_path_buf()
+        self.path.clone()
     }
 
     /// Returns the approximate amount of bytes that could be saved when
@@ -59,7 +132,7 @@ impl LogFs {
     }
 
     /// Get a key.
-    pub fn get(&self, path: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>, LogFsError> {
+    pub fn get(&self, path: impl AsRef<str>) -> Result<Option<Vec<u8>>, LogFsError> {
         let pointer = match self
             .inner
             .state
@@ -73,17 +146,36 @@ impl LogFs {
                 return Ok(None);
             }
         };
-        let data = self
-            .inner
-            .journal
-            .read_data(self.inner.crypto.as_ref(), &pointer)?;
+        let data = self.inner.journal.read_data(&pointer)?;
         Ok(Some(data))
+    }
+
+    pub fn get_reader(&self, path: impl AsRef<str>) -> Result<StdKeyReader, LogFsError> {
+        let path = path.as_ref();
+
+        let pointer = match self.inner.state.read().unwrap().get_key(path).cloned() {
+            Some(pointer) => pointer,
+            None => return Err(LogFsError::NotFound { path: path.into() }),
+        };
+        let reader = self.inner.journal.reader(&pointer)?;
+        Ok(reader)
+    }
+
+    pub fn get_chunks(&self, path: impl AsRef<str>) -> Result<KeyChunkIter, LogFsError> {
+        let path = path.as_ref();
+
+        let pointer = match self.inner.state.read().unwrap().get_key(path).cloned() {
+            Some(pointer) => pointer,
+            None => return Err(LogFsError::NotFound { path: path.into() }),
+        };
+        let reader = self.inner.journal.read_chunks(&pointer)?;
+        Ok(reader)
     }
 
     /// Get all paths in the given range.
     pub fn paths_range<R>(&self, range: R) -> Result<Vec<Path>, LogFsError>
     where
-        R: std::ops::RangeBounds<Vec<u8>>,
+        R: std::ops::RangeBounds<String>,
     {
         Ok(self.inner.state.read().unwrap().paths_range(range))
     }
@@ -94,27 +186,33 @@ impl LogFs {
     }
 
     /// Get all paths with a given prefix.
-    pub fn paths_prefix(&self, prefix: &[u8]) -> Result<Vec<Path>, LogFsError> {
+    pub fn paths_prefix(&self, prefix: &str) -> Result<Vec<Path>, LogFsError> {
         Ok(self.inner.state.read().unwrap().paths_prefix(prefix))
     }
 
     /// Insert a key.
-    pub fn insert(&self, path: impl Into<Vec<u8>>, data: Vec<u8>) -> Result<(), LogFsError> {
+    pub fn insert(&self, path: impl Into<String>, data: Vec<u8>) -> Result<(), LogFsError> {
         let path = path.into();
         let mut state = self.inner.state.write().unwrap();
-        let pointer =
-            self.inner
-                .journal
-                .write_insert(self.inner.crypto.as_ref(), path.clone(), data)?;
+        let pointer = self.inner.journal.write_insert(path.clone(), data)?;
         state.add_key(path, pointer);
         Ok(())
+    }
+
+    pub fn insert_writer(
+        &self,
+        path: impl Into<String>,
+    ) -> Result<journal::v2::KeyWriter, LogFsError> {
+        self.inner
+            .journal
+            .insert_writer(path.into(), self.inner.state.clone())
     }
 
     /// Rename a key.
     pub fn rename(
         &self,
-        old_key: impl Into<Vec<u8>>,
-        new_key: impl Into<Vec<u8>>,
+        old_key: impl Into<String>,
+        new_key: impl Into<String>,
     ) -> Result<(), LogFsError> {
         let old_key = old_key.into();
         let new_key = new_key.into();
@@ -127,11 +225,9 @@ impl LogFs {
             });
         }
 
-        self.inner.journal.write_rename(
-            self.inner.crypto.as_ref(),
-            old_key.to_vec(),
-            new_key.clone(),
-        )?;
+        self.inner
+            .journal
+            .write_rename(old_key.clone(), new_key.clone())?;
 
         // NOTE: unwrap can't fail, since key existence was checked above.
         state.rename_key(&old_key, new_key).unwrap();
@@ -140,29 +236,25 @@ impl LogFs {
     }
 
     /// Remove a key.
-    pub fn remove(&self, path: impl AsRef<[u8]>) -> Result<(), LogFsError> {
+    pub fn remove(&self, path: impl AsRef<str>) -> Result<(), LogFsError> {
         let path = path.as_ref();
 
         let mut state = self.inner.state.write().unwrap();
 
         if let Some(_pointer) = state.remove_key(path) {
-            self.inner
-                .journal
-                .write_remove(self.inner.crypto.as_ref(), vec![path.to_vec()])?;
+            self.inner.journal.write_remove(vec![path.to_string()])?;
         }
 
         Ok(())
     }
 
     /// Remove a whole key prefix.
-    pub fn remove_prefix(&self, prefix: impl AsRef<[u8]>) -> Result<(), LogFsError> {
+    pub fn remove_prefix(&self, prefix: impl AsRef<str>) -> Result<(), LogFsError> {
         let mut state = self.inner.state.write().unwrap();
         let paths = state.paths_prefix(prefix.as_ref());
 
         if !paths.is_empty() {
-            self.inner
-                .journal
-                .write_remove(self.inner.crypto.as_ref(), paths.clone())?;
+            self.inner.journal.write_remove(paths.clone())?;
         }
 
         for path in paths {
@@ -173,13 +265,39 @@ impl LogFs {
     }
 }
 
+impl LogFs<Journal2> {
+    pub fn migrate(self) -> Result<(), LogFsError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{Read, Write},
+        num::NonZeroU32,
+    };
+
+    use crate::journal::Journal2;
+
     use super::*;
 
-    const TEST_PW: &'static str = "logfs";
+    fn test_config(name: &str) -> LogConfig {
+        LogConfig {
+            path: temp_test_dir(name),
+            raw_mode: false,
+            allow_create: false,
+            crypto: Some(CryptoConfig {
+                key: "logfs".to_string().into(),
+                salt: b"salt".to_vec().into(),
+                iterations: NonZeroU32::new(1).unwrap(),
+            }),
+            // Set a very low chunk size to test chunking.
+            default_chunk_size: 3,
+        }
+    }
 
-    fn test_db(name: &str) -> LogFs {
+    pub fn temp_test_dir(name: &str) -> PathBuf {
         let tmp_dir = std::env::temp_dir().join("logfs_tests");
         if !tmp_dir.is_dir() {
             std::fs::create_dir_all(&tmp_dir).unwrap();
@@ -188,14 +306,17 @@ mod tests {
         if path.exists() {
             std::fs::remove_file(&path).unwrap();
         }
+        path
+    }
 
-        LogFs::open(&path, TEST_PW.into()).unwrap()
+    fn test_db<J: JournalStore>(name: &str) -> LogFs<J> {
+        LogFs::<J>::open(test_config(name)).unwrap()
     }
 
     #[test]
     fn test_full_flow() {
-        let log = test_db("full_flow");
-        let path = log.path().clone();
+        let config = test_config("full_flow");
+        let log = LogFs::<Journal2>::open(config.clone()).unwrap();
 
         let key1 = "a/b/c";
         let content1 = b"hello there".to_vec();
@@ -218,7 +339,8 @@ mod tests {
         // Now drop the DB and re-open to verify that re-loading works.
         std::mem::drop(log);
 
-        let log2 = LogFs::open(&path, TEST_PW.into()).unwrap();
+        let log2 = LogFs::<Journal2>::open(config.clone()).unwrap();
+
         assert_eq!(log2.get(key1).unwrap(), Some(content1.clone()));
         assert_eq!(log2.get(key2).unwrap(), Some(content2.clone()));
 
@@ -232,7 +354,7 @@ mod tests {
 
         std::mem::drop(log2);
 
-        let log3 = LogFs::open(&path, TEST_PW.into()).unwrap();
+        let log3 = LogFs::<Journal2>::open(config.clone()).unwrap();
         assert_eq!(log3.get(key1).unwrap(), None);
         assert_eq!(log3.get(key2).unwrap(), Some(content2.clone()));
 
@@ -242,7 +364,7 @@ mod tests {
 
     #[test]
     fn test_iterate_range() -> Result<(), LogFsError> {
-        let db = test_db("iterate_range");
+        let db = test_db::<Journal2>("iterate_range");
         db.insert("a", vec![0])?;
         db.insert("b", vec![0])?;
         db.insert("c/1", vec![1])?;
@@ -251,20 +373,23 @@ mod tests {
         db.insert("e", vec![0])?;
 
         // Exclusive range.
-        let mut keys = db.paths_range(b"b".to_vec()..b"d".to_vec())?;
+        let mut keys = db.paths_range("b".to_string().."d".to_string())?;
         keys.sort();
-        assert_eq!(keys, vec![b"b".to_vec(), b"c/1".to_vec(), b"c/2".to_vec(),]);
+        assert_eq!(
+            keys,
+            vec!["b".to_string(), "c/1".to_string(), "c/2".to_string(),]
+        );
 
         // Inclusive range.
-        let mut keys = db.paths_range(b"b".to_vec()..=b"d".to_vec())?;
+        let mut keys = db.paths_range("b".to_string()..="d".to_string())?;
         keys.sort();
         assert_eq!(
             keys,
             vec![
-                b"b".to_vec(),
-                b"c/1".to_vec(),
-                b"c/2".to_vec(),
-                b"d".to_vec(),
+                "b".to_string(),
+                "c/1".to_string(),
+                "c/2".to_string(),
+                "d".to_string(),
             ]
         );
 
@@ -274,12 +399,12 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                b"a".to_vec(),
-                b"b".to_vec(),
-                b"c/1".to_vec(),
-                b"c/2".to_vec(),
-                b"d".to_vec(),
-                b"e".to_vec(),
+                "a".to_string(),
+                "b".to_string(),
+                "c/1".to_string(),
+                "c/2".to_string(),
+                "d".to_string(),
+                "e".to_string(),
             ]
         );
 
@@ -288,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_iterate_prefix() -> Result<(), LogFsError> {
-        let db = test_db("iterate_prefix");
+        let db = test_db::<Journal2>("iterate_prefix");
         db.insert("a", vec![0])?;
         db.insert("b", vec![0])?;
         db.insert("c", vec![1])?;
@@ -297,26 +422,29 @@ mod tests {
         db.insert("d", vec![0])?;
         db.insert("e", vec![0])?;
 
-        let mut keys = db.paths_prefix(b"c")?;
+        let mut keys = db.paths_prefix("c")?;
         keys.sort();
-        assert_eq!(keys, vec![b"c".to_vec(), b"c/1".to_vec(), b"c/2".to_vec(),]);
+        assert_eq!(
+            keys,
+            vec!["c".to_string(), "c/1".to_string(), "c/2".to_string(),]
+        );
 
-        let keys = db.paths_prefix(b"d")?;
-        assert_eq!(keys, vec![b"d".to_vec(),]);
+        let keys = db.paths_prefix("d")?;
+        assert_eq!(keys, vec!["d".to_string(),]);
 
         // All.
-        let mut keys = db.paths_prefix(b"")?;
+        let mut keys = db.paths_prefix("")?;
         keys.sort();
         assert_eq!(
             keys,
             vec![
-                b"a".to_vec(),
-                b"b".to_vec(),
-                b"c".to_vec(),
-                b"c/1".to_vec(),
-                b"c/2".to_vec(),
-                b"d".to_vec(),
-                b"e".to_vec(),
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "c/1".to_string(),
+                "c/2".to_string(),
+                "d".to_string(),
+                "e".to_string(),
             ]
         );
 
@@ -325,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_remove_multiple_paths() -> Result<(), LogFsError> {
-        let db = test_db("remove_multiple_paths");
+        let db = test_db::<Journal2>("remove_multiple_paths");
         db.insert("other", vec![0])?;
         db.insert("prefix", vec![0])?;
         db.insert("prefix/1", vec![1])?;
@@ -337,7 +465,76 @@ mod tests {
 
         let mut keys = db.paths_range(..)?;
         keys.sort();
-        assert_eq!(keys, vec![b"blub".to_vec(), b"other".to_vec()]);
+        assert_eq!(keys, vec!["blub".to_string(), "other".to_string()]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_writer() -> Result<(), LogFsError> {
+        let config = test_config("writer");
+        let db = LogFs::<Journal2>::open(config.clone())?;
+
+        let path1 = "regular";
+        let data1 = b"regular111111111".to_vec();
+        db.insert(path1, data1.clone())?;
+
+        let path2 = "writer/1";
+        let mut writer = db.insert_writer(path2)?;
+        let data2 = b"123456789123456789123456789123456789";
+        writer.write_all(data2)?;
+        writer.finish()?;
+
+        let path3 = "writer/2";
+        let mut writer = db.insert_writer(path3)?;
+        let data3 = b"123456789123456789123456789123456789";
+        writer.write_all(data3)?;
+        writer.finish()?;
+
+        assert_eq!(db.get(path1)?.unwrap(), data1);
+        assert_eq!(db.get(path2)?.unwrap(), data2);
+        assert_eq!(db.get(path3)?.unwrap(), data3);
+
+        std::mem::drop(db);
+        let db = LogFs::<Journal2>::open(config.clone())?;
+
+        assert_eq!(db.get(path1)?.unwrap(), data1);
+        assert_eq!(db.get(path2)?.unwrap(), data2);
+        assert_eq!(db.get(path3)?.unwrap(), data3);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reader() -> Result<(), LogFsError> {
+        let config = test_config("reader");
+        let path = "key";
+        let data = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb";
+
+        let db = LogFs::<Journal2>::open(config.clone())?;
+        db.insert(path, data.into())?;
+        assert_eq!(db.get(path)?.unwrap(), data.as_bytes());
+
+        let mut reader = db.get_reader(path)?;
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        assert_eq!(&buf, data);
+
+        std::mem::drop(db);
+
+        let db = LogFs::<Journal2>::open(config.clone())?;
+        assert_eq!(db.get(path)?.unwrap(), data.as_bytes());
+
+        let mut reader = db.get_reader(path)?;
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        assert_eq!(&buf, data);
+
+        let mut all = Vec::new();
+        for res in db.get_chunks(path)? {
+            all.extend(res?);
+        }
+        assert_eq!(&all, data.as_bytes());
 
         Ok(())
     }

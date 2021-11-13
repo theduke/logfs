@@ -1,4 +1,7 @@
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    num::NonZeroU32,
+};
 
 use structopt::StructOpt;
 
@@ -22,17 +25,62 @@ enum Subcommand {
     Delete {
         key: String,
     },
+    Migrate {
+        #[structopt(long)]
+        new_path: Option<String>,
+        #[structopt(long)]
+        new_key: Option<String>,
+        #[structopt(long)]
+        new_salt: Option<String>,
+        #[structopt(long)]
+        new_iterations: Option<u32>,
+    },
 }
 
 #[derive(StructOpt)]
 struct Options {
     #[structopt(short, long)]
     path: String,
+    #[structopt(long)]
+    create: bool,
+    #[structopt(long)]
+    raw: bool,
     #[structopt(short, long)]
-    key: String,
+    key: Option<String>,
+    #[structopt(long)]
+    salt: Option<String>,
+    #[structopt(long)]
+    key_iterations: Option<u32>,
+
+    #[structopt(long)]
+    version: u32,
 
     #[structopt(subcommand)]
     cmd: Subcommand,
+}
+
+impl Options {
+    fn build_config(&self) -> logfs::LogConfig {
+        logfs::LogConfig {
+            path: self.path.clone().into(),
+            raw_mode: self.raw,
+            allow_create: self.create,
+            crypto: self.key.as_ref().map(|key| logfs::CryptoConfig {
+                key: zeroize::Zeroizing::new(key.to_string()),
+                salt: self
+                    .salt
+                    .as_ref()
+                    .map(|s| zeroize::Zeroizing::new(s.clone().into_bytes()))
+                    .unwrap_or(zeroize::Zeroizing::new(b"logfs".to_vec())),
+                iterations: self
+                    .key_iterations
+                    .as_ref()
+                    .map(|v| NonZeroU32::new(*v).unwrap())
+                    .unwrap_or(NonZeroU32::new(100_000).unwrap()),
+            }),
+            default_chunk_size: 4_000_000,
+        }
+    }
 }
 
 fn pretty_value(value: &[u8]) -> String {
@@ -42,8 +90,8 @@ fn pretty_value(value: &[u8]) -> String {
     }
 }
 
-fn run(opt: Options) -> Result<(), logfs::LogFsError> {
-    let db = logfs::LogFs::open(opt.path, opt.key)?;
+fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
+    let db = logfs::LogFs::<J>::open(opt.build_config())?;
 
     match opt.cmd {
         Subcommand::List { offset, max } => {
@@ -51,7 +99,7 @@ fn run(opt: Options) -> Result<(), logfs::LogFsError> {
             let mut lock = stdout.lock();
 
             for path in db.paths_offset(offset.unwrap_or_default(), max.unwrap_or(1000))? {
-                write!(&mut lock, "{}\n", pretty_value(&path)).unwrap();
+                write!(&mut lock, "{}\n", path).unwrap();
             }
 
             Ok(())
@@ -88,10 +136,29 @@ fn run(opt: Options) -> Result<(), logfs::LogFsError> {
             }
             Ok(())
         }
+        Subcommand::Migrate { .. } => {
+            unimplemented!()
+        }
     }
 }
 
 fn main() -> Result<(), logfs::LogFsError> {
     let opt = Options::from_args();
-    run(opt)
+
+    if let Subcommand::Migrate { .. } = &opt.cmd {
+        if opt.version == 2 {
+            eprintln!("Nothing to migrate");
+            Ok(())
+        } else {
+            panic!("Unsupported version {}", opt.version);
+        }
+    } else {
+        if opt.version == 1 {
+            run::<logfs::Journal2>(opt)
+        } else if opt.version == 2 {
+            run::<logfs::Journal2>(opt)
+        } else {
+            panic!("Unsupported version {}", opt.version);
+        }
+    }
 }
