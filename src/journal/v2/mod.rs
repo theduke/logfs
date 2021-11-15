@@ -118,14 +118,14 @@ impl Journal2 {
             }
         }
 
+        let is_new = path.is_file();
+
         // TODO: use file locks on platforms that support it.
         let file = std::fs::OpenOptions::new()
             .create(config.allow_create)
             .read(true)
             .write(true)
             .open(&path)?;
-        let meta = file.metadata()?;
-        let file_size = meta.len();
 
         let tainted = TaintedFlag(Arc::new(AtomicBool::new(false)));
 
@@ -133,22 +133,29 @@ impl Journal2 {
             match Self::open_existing(file, state, &crypto, &tainted) {
                 Ok(w) => w,
                 Err(_err) => {
-                    if config.allow_create {
-                        let file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .read(true)
-                            .write(true)
-                            .open(&path)?;
-                        LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
-                    } else {
-                        return Err(LogFsError::new_internal(
-                            "Could not open database: file does not appear to be a log",
-                        ));
-                    }
+                    // if config.allow_create {
+                    //     let file = std::fs::OpenOptions::new()
+                    //         .create(true)
+                    //         .read(true)
+                    //         .write(true)
+                    //         .open(&path)?;
+                    //     LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
+                    // } else {
+                    return Err(LogFsError::new_internal(
+                        "Could not open database: file does not appear to be a log",
+                    ));
+                    // }
                 }
             }
-        } else if file_size == 0 {
-            LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
+        } else if is_new {
+            if config.allow_create {
+                LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
+            } else {
+                return Err(LogFsError::new_internal(format!(
+                    "No log found at {}",
+                    config.path.display()
+                )));
+            }
         } else {
             Self::open_existing(file, state, &crypto, &tainted)?
         };
