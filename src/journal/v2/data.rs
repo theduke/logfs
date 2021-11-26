@@ -1,6 +1,6 @@
 //! Types representing the data written to the log.
 
-use crate::journal::SequenceId;
+use crate::{crypto::Crypto, journal::SequenceId};
 
 // /// A magic marker used to
 // #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone, Debug)]
@@ -135,6 +135,23 @@ pub enum JournalAction {
     KeyDelete(ActionKeyDelete),
     /// Persist a new full keyspace index.
     IndexWrite(ActionIndexWrite),
+}
+
+impl JournalAction {
+    pub fn payload_len(&self, crypto: Option<&Crypto>) -> u64 {
+        match self {
+            Self::KeyInsert(key) => {
+                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as u64;
+                key.meta.size + (padding * key.meta.chunk_count() as u64)
+            }
+            Self::KeyRename(_) => 0,
+            Self::KeyDelete(_) => 0,
+            Self::IndexWrite(w) => {
+                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as u64;
+                w.size as u64 + padding
+            }
+        }
+    }
 }
 
 bitflags::bitflags! {

@@ -1,12 +1,13 @@
 mod error;
-use journal::v2::{KeyChunkIter, StdKeyReader};
-pub use journal::{Journal2, JournalStore};
-
 pub use self::error::LogFsError;
 
-mod state;
-
 mod journal;
+mod state;
+use journal::{
+    v2::{KeyChunkIter, StdKeyReader},
+    SequenceId,
+};
+pub use journal::{Journal2, JournalStore};
 
 mod crypto;
 pub use crypto::CryptoConfig;
@@ -75,6 +76,13 @@ pub struct LogConfig {
     pub default_chunk_size: u32,
 }
 
+pub struct RepairConfig {
+    pub dry_run: bool,
+    pub start_sequence: Option<u64>,
+    /// The path to which a recovered log should be written.
+    pub recovery_path: Option<PathBuf>,
+}
+
 pub struct LogFs<J = journal::Journal2> {
     inner: Arc<Inner<J>>,
     path: PathBuf,
@@ -99,6 +107,7 @@ type DataOffset = u64;
 impl<J: JournalStore> LogFs<J> {
     // TODO: add open() without key and open_encrypted() with key.
     pub fn open(mut config: LogConfig) -> Result<Self, LogFsError> {
+        tracing::trace!(?config, "opening logfs");
         let crypto = config
             .crypto
             .take()
@@ -114,6 +123,24 @@ impl<J: JournalStore> LogFs<J> {
                 journal,
             }),
         })
+    }
+
+    pub fn repair(mut config: LogConfig, repair_config: RepairConfig) -> Result<(), LogFsError> {
+        let crypto = config
+            .crypto
+            .take()
+            .map(|c| Arc::new(crypto::Crypto::new(c)));
+        J::repair(
+            &config,
+            crypto.clone(),
+            journal::RepairConfig {
+                dry_run: repair_config.dry_run,
+                start_sequence: repair_config.start_sequence.map(SequenceId::from_u64),
+                recovery_path: repair_config.recovery_path,
+            },
+        )?;
+
+        Ok(())
     }
 
     /// Get the file system path.
@@ -286,7 +313,7 @@ mod tests {
         LogConfig {
             path: temp_test_dir(name),
             raw_mode: false,
-            allow_create: false,
+            allow_create: true,
             crypto: Some(CryptoConfig {
                 key: "logfs".to_string().into(),
                 salt: b"salt".to_vec().into(),

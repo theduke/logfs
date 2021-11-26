@@ -1,7 +1,7 @@
 pub mod v2;
 pub use v2::Journal2;
 
-use std::{num::NonZeroU64, sync::Arc};
+use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
 
 use crate::{
     crypto::Crypto,
@@ -50,6 +50,13 @@ impl SequenceId {
     }
 }
 
+pub struct RepairConfig {
+    pub dry_run: bool,
+    pub start_sequence: Option<SequenceId>,
+    /// The path to which a recovered log should be written.
+    pub recovery_path: Option<PathBuf>,
+}
+
 pub trait JournalStore {
     fn open(
         path: std::path::PathBuf,
@@ -57,6 +64,14 @@ pub trait JournalStore {
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError>
+    where
+        Self: Sized;
+
+    fn repair(
+        log_config: &LogConfig,
+        crypto: Option<Arc<Crypto>>,
+        repair_config: RepairConfig,
+    ) -> Result<(), LogFsError>
     where
         Self: Sized;
 

@@ -5,7 +5,7 @@ use std::{
 
 use structopt::StructOpt;
 
-#[derive(StructOpt)]
+#[derive(StructOpt, Clone)]
 enum Subcommand {
     List {
         #[structopt(short, long)]
@@ -35,14 +35,23 @@ enum Subcommand {
         #[structopt(long)]
         new_iterations: Option<u32>,
     },
+    Repair {
+        #[structopt(long)]
+        overwrite: bool,
+        #[structopt(long)]
+        start_sequence: Option<u64>,
+        #[structopt(long)]
+        recovery_path: Option<String>,
+    },
 }
 
-#[derive(StructOpt)]
+#[derive(StructOpt, Clone)]
 struct Options {
     #[structopt(short, long)]
     path: String,
     #[structopt(long)]
     create: bool,
+    /// Enables raw mode, which allows using raw block devices without a filesystem.
     #[structopt(long)]
     raw: bool,
     #[structopt(short, long)]
@@ -53,7 +62,7 @@ struct Options {
     key_iterations: Option<u32>,
 
     #[structopt(long)]
-    version: u32,
+    version: Option<u32>,
 
     #[structopt(subcommand)]
     cmd: Subcommand,
@@ -91,10 +100,9 @@ fn pretty_value(value: &[u8]) -> String {
 }
 
 fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
-    let db = logfs::LogFs::<J>::open(opt.build_config())?;
-
-    match opt.cmd {
+    match opt.cmd.clone() {
         Subcommand::List { offset, max } => {
+            let db = logfs::LogFs::<J>::open(opt.build_config())?;
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
 
@@ -104,20 +112,26 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 
             Ok(())
         }
-        Subcommand::Get { key } => match db.get(&key) {
-            Ok(Some(value)) => {
-                println!("{}", pretty_value(&value));
-                Ok(())
+        Subcommand::Get { key } => {
+            let db = logfs::LogFs::<J>::open(opt.build_config())?;
+
+            match db.get(&key) {
+                Ok(Some(value)) => {
+                    println!("{}", pretty_value(&value));
+                    Ok(())
+                }
+                Ok(None) => {
+                    eprintln!("Key '{}' not found", key);
+                    std::process::exit(1);
+                }
+                Err(err) => {
+                    return Err(err);
+                }
             }
-            Ok(None) => {
-                eprintln!("Key '{}' not found", key);
-                std::process::exit(1);
-            }
-            Err(err) => {
-                return Err(err);
-            }
-        },
+        }
         Subcommand::Set { key, value } => {
+            let db = logfs::LogFs::<J>::open(opt.build_config())?;
+
             if value == "-" {
                 let mut buffer = Vec::new();
                 std::io::stdin().read_to_end(&mut buffer)?;
@@ -127,6 +141,8 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             }
         }
         Subcommand::Delete { key } => {
+            let db = logfs::LogFs::<J>::open(opt.build_config())?;
+
             if db.get(&key).is_ok() {
                 db.remove(&key)?;
                 eprintln!("Key '{}' deleted", key);
@@ -137,7 +153,25 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             Ok(())
         }
         Subcommand::Migrate { .. } => {
-            unimplemented!()
+            eprintln!("Nothing to migrate");
+            Ok(())
+        }
+        Subcommand::Repair {
+            overwrite,
+            start_sequence,
+            recovery_path,
+        } => {
+            std::env::set_var("RUST_LOG", "logfs=trace");
+            tracing_subscriber::fmt::init();
+
+            let config = opt.build_config();
+            let dry_run = !overwrite;
+            let r = logfs::RepairConfig {
+                dry_run,
+                start_sequence,
+                recovery_path: recovery_path.map(std::path::PathBuf::from),
+            };
+            logfs::LogFs::<logfs::Journal2>::repair(config, r)
         }
     }
 }
@@ -145,20 +179,10 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 fn main() -> Result<(), logfs::LogFsError> {
     let opt = Options::from_args();
 
-    if let Subcommand::Migrate { .. } = &opt.cmd {
-        if opt.version == 2 {
-            eprintln!("Nothing to migrate");
-            Ok(())
-        } else {
-            panic!("Unsupported version {}", opt.version);
-        }
+    let version = opt.version.unwrap_or(2);
+    if version == 2 {
+        run::<logfs::Journal2>(opt)
     } else {
-        if opt.version == 1 {
-            run::<logfs::Journal2>(opt)
-        } else if opt.version == 2 {
-            run::<logfs::Journal2>(opt)
-        } else {
-            panic!("Unsupported version {}", opt.version);
-        }
+        panic!("Unsupported version {}", version);
     }
 }

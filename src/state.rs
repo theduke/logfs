@@ -12,7 +12,7 @@ pub type DataOffset = u64;
 #[derive(Clone, Debug)]
 pub struct KeyPointer {
     pub sequence_id: u64,
-    pub offset: DataOffset,
+    pub file_offset: DataOffset,
     pub size: u64,
     pub chunk_size: Option<u32>,
 }

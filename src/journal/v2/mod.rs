@@ -1,5 +1,6 @@
 use std::{
-    io::{BufReader, BufWriter, Read, Seek, Write},
+    collections::{BTreeMap, HashMap},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     sync::{atomic::AtomicBool, Arc, Mutex, RwLock},
 };
 
@@ -11,9 +12,9 @@ use crate::{
     LogConfig, LogFsError,
 };
 
-use self::data::ByteCountU64;
+use self::data::{ByteCountU64, Offset};
 
-use super::SequenceId;
+use super::{RepairConfig, SequenceId};
 
 mod data;
 
@@ -28,6 +29,10 @@ struct PersistedEntry {
 struct TaintedFlag(Arc<AtomicBool>);
 
 impl TaintedFlag {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
     fn set_tainted(&self) {
         self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -105,6 +110,125 @@ impl State {
     }
 }
 
+/// Try to find a valid entry header at an arbitrary position in a buffer.
+/// Useful for recovery of corrupted logs.
+fn find_entry_header_in_slice(
+    crypto: Option<&Crypto>,
+    sequence: SequenceId,
+    data: &[u8],
+) -> Option<(data::JournalEntryHeader, Offset)> {
+    if let Some(crypto) = crypto {
+        let header_len =
+            data::JournalEntryHeader::SERIALIZED_LEN + crypto.extra_payload_len() as usize;
+
+        for index in 0..=(data.len() - header_len) {
+            let mut slice = data[index..index + header_len].to_vec();
+            let decrypted =
+                match crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_HEADER_CHUNK, &mut slice) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        continue;
+                    }
+                };
+
+            match bincode::deserialize::<data::JournalEntryHeader>(&decrypted) {
+                Ok(header) => return Some((header, index as u64)),
+                Err(_) => continue,
+            }
+        }
+        None
+    } else {
+        todo!()
+    }
+}
+
+fn determine_file_size(f: &mut std::fs::File) -> Result<u64, LogFsError> {
+    let metadata = f.metadata()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::prelude::FileTypeExt;
+
+        if metadata.file_type().is_block_device() {
+            let start_offset = f.stream_position()?;
+            // The regular metadata len for block devices is 0.
+            // Accurate size can be found by seeking to the end.
+            f.seek(SeekFrom::End(0))?;
+            let size = f.stream_position()?;
+            f.seek(SeekFrom::Start(start_offset))?;
+            return Ok(size);
+        }
+    }
+
+    if metadata.is_file() {
+        Ok(metadata.len())
+    } else {
+        Err(LogFsError::new_internal(
+            "Invalid path: expected a file or a block device",
+        ))
+    }
+}
+
+fn read_entry_header(
+    reader: &mut impl std::io::Read,
+    buffer: &mut Vec<u8>,
+    crypto: Option<&Crypto>,
+    sequence: SequenceId,
+) -> Result<data::JournalEntryHeader, LogFsError> {
+    let size = data::JournalEntryHeader::SERIALIZED_LEN
+        + crypto.map(|c| c.extra_payload_len() as usize).unwrap_or(0);
+    buffer.resize(size, 0);
+
+    // Read into buffer.
+    reader.read_exact(buffer)?;
+
+    // Decrypt.
+    let data = if let Some(crypto) = &crypto {
+        crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_HEADER_CHUNK, buffer)?
+    } else {
+        &buffer
+    };
+
+    let header: data::JournalEntryHeader = bincode::deserialize(data)?;
+    Ok(header)
+}
+
+fn read_entry_action(
+    reader: &mut impl std::io::Read,
+    buffer: &mut Vec<u8>,
+    crypto: Option<&Crypto>,
+    header: &data::JournalEntryHeader,
+) -> Result<data::JournalAction, LogFsError> {
+    let action_size = header.action_size as usize;
+    buffer.resize(action_size, 0);
+
+    // Read into buffer.
+    reader.read_exact(buffer)?;
+
+    // Decrypt.
+
+    let action_data = if let Some(crypto) = &crypto {
+        crypto.decrypt_data_ref(header.sequence_id.as_u64(), ENTRY_ACTION_CHUNK, buffer)?
+    } else {
+        &buffer
+    };
+
+    let action: data::JournalAction = bincode::deserialize(action_data)?;
+    Ok(action)
+}
+
+fn read_entry(
+    reader: &mut impl std::io::Read,
+    buffer: &mut Vec<u8>,
+    crypto: Option<&Crypto>,
+    sequence: SequenceId,
+) -> Result<data::JournalEntry, LogFsError> {
+    let header = read_entry_header(reader, buffer, crypto, sequence)?;
+    let action = read_entry_action(reader, buffer, crypto, &header)?;
+
+    Ok(data::JournalEntry { header, action })
+}
+
 impl Journal2 {
     pub fn open(
         path: std::path::PathBuf,
@@ -118,7 +242,11 @@ impl Journal2 {
             }
         }
 
-        let is_new = path.is_file();
+        if path.is_dir() {
+            return Err(LogFsError::new_internal("Database path is a directory"));
+        }
+
+        let is_new = !path.exists();
 
         // TODO: use file locks on platforms that support it.
         let file = std::fs::OpenOptions::new()
@@ -127,28 +255,31 @@ impl Journal2 {
             .write(true)
             .open(&path)?;
 
-        let tainted = TaintedFlag(Arc::new(AtomicBool::new(false)));
+        let tainted = TaintedFlag::new();
+
+        tracing::trace!(?path, "opening logfs");
 
         let writer = if config.raw_mode {
             match Self::open_existing(file, state, &crypto, &tainted) {
                 Ok(w) => w,
                 Err(_err) => {
-                    // if config.allow_create {
-                    //     let file = std::fs::OpenOptions::new()
-                    //         .create(true)
-                    //         .read(true)
-                    //         .write(true)
-                    //         .open(&path)?;
-                    //     LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
-                    // } else {
-                    return Err(LogFsError::new_internal(
-                        "Could not open database: file does not appear to be a log",
-                    ));
-                    // }
+                    if config.allow_create {
+                        let file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .read(true)
+                            .write(true)
+                            .open(&path)?;
+                        LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
+                    } else {
+                        return Err(LogFsError::new_internal(
+                            "Could not open database: file does not appear to be a log",
+                        ));
+                    }
                 }
             }
         } else if is_new {
             if config.allow_create {
+                tracing::trace!(?path, "creating new log");
                 LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
             } else {
                 return Err(LogFsError::new_internal(format!(
@@ -157,6 +288,7 @@ impl Journal2 {
                 )));
             }
         } else {
+            tracing::trace!(?path, "opening existing log");
             Self::open_existing(file, state, &crypto, &tainted)?
         };
 
@@ -172,6 +304,265 @@ impl Journal2 {
         };
 
         Ok(j)
+    }
+
+    pub fn repair(
+        log_config: &LogConfig,
+        crypto: Option<Arc<Crypto>>,
+        config: RepairConfig,
+    ) -> Result<(), LogFsError> {
+        // TODO: tracing here instead of eprintln!
+
+        let mut f = std::fs::File::open(&log_config.path)?;
+        let file_size = determine_file_size(&mut f)?;
+
+        f.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(f);
+
+        // let _superblock = match reader.read_superblocks() {
+        //     Ok(s) => Some(s),
+        //     Err(error) => {
+        //         tracing::warn!(?error, "could not read superblocks");
+        //         None
+        //     }
+        // };
+
+        let sequence = config.start_sequence.unwrap_or(SequenceId::from_u64(1));
+        let mut file_offset = 0;
+        let mut buffer = Vec::new();
+
+        let mut entry_and_offset = None;
+        loop {
+            let chunk_len = std::cmp::min(100_000_000, file_size - file_offset);
+            if chunk_len == 0 {
+                break;
+            }
+            tracing::trace!(?sequence, %file_offset, "searching for log entry");
+            buffer.resize(chunk_len as usize, 0);
+            reader.read_exact(&mut buffer)?;
+
+            if let Some((header, buffer_offset)) =
+                find_entry_header_in_slice(crypto.as_ref().map(|c| &**c), sequence, &buffer)
+            {
+                entry_and_offset = Some((header, file_offset + buffer_offset));
+                break;
+            }
+
+            file_offset += chunk_len;
+        }
+
+        let (header, offset) = entry_and_offset
+            .ok_or_else(|| LogFsError::new_internal("Could not find log entries in data"))?;
+
+        tracing::trace!(?header, offset, "found entry header");
+
+        reader.seek(SeekFrom::Start(offset))?;
+
+        let crypto_ref = crypto.as_ref().map(|c| &**c);
+
+        let mut buffer = Vec::new();
+        let mut sequence = header.sequence_id;
+        let mut state = crate::state::State::new();
+
+        loop {
+            let entry = match read_entry(&mut reader, &mut buffer, crypto_ref.clone(), sequence) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(?error, "could not read entry. stopping read recovery");
+                    break;
+                }
+            };
+
+            let data_offset = reader.stream_position()?;
+
+            let payload_len = entry.action.payload_len(crypto_ref.clone());
+            if let Err(error) = reader.seek(SeekFrom::Current(payload_len as i64)) {
+                tracing::warn!(
+                    ?entry,
+                    ?error,
+                    "entry is missing payload. stopping read recovery"
+                );
+                break;
+            }
+
+            tracing::trace!(?entry, "recovered entry");
+
+            match entry.action {
+                data::JournalAction::KeyInsert(k) => {
+                    let meta = k.meta;
+                    state.add_key(
+                        meta.path,
+                        KeyPointer {
+                            sequence_id: entry.header.sequence_id.as_u64(),
+                            file_offset: data_offset,
+                            size: meta.size,
+                            chunk_size: meta.chunk_size,
+                        },
+                    );
+                }
+                data::JournalAction::KeyRename(r) => {
+                    for rename in r.renames {
+                        state.rename_key(&rename.old_key, rename.new_key).unwrap();
+                    }
+                }
+                data::JournalAction::KeyDelete(d) => {
+                    for path in d.deleted_keys {
+                        state.remove_key(&path);
+                    }
+                }
+                data::JournalAction::IndexWrite(_) => {}
+            };
+
+            // TODO: handle error
+            sequence = sequence.try_increment()?;
+        }
+
+        if state.tree.is_empty() {
+            return Err(LogFsError::new_internal("Could not recovery any data"));
+        }
+
+        tracing::info!(key_count = state.tree.len(), "recovered keys");
+
+        let target_path = match config.recovery_path {
+            Some(p) => p,
+            None => {
+                tracing::info!("Stopping recovery. Specify recovery path to persist.");
+                return Ok(());
+            }
+        };
+
+        let mut new_state = crate::state::State::new();
+        let new_config = LogConfig {
+            allow_create: true,
+            ..log_config.clone()
+        };
+        let j = Journal2::open(target_path, &mut new_state, crypto.clone(), &new_config)?;
+
+        let mut file = reader.into_inner();
+        for (key, pointer) in state.tree {
+            tracing::trace!(?key, "restoring key");
+            let reader = KeyDataReader::new(crypto.clone(), &pointer, file)?;
+            // TODO: partial writes to allow recovering large files / safe memory.
+            let (data, f) = reader.read_all()?;
+
+            j.write_insert(
+                key.clone(),
+                data,
+                pointer.chunk_size.unwrap_or(log_config.default_chunk_size),
+            )?;
+            file = f;
+
+            tracing::debug!(?key, "key restored");
+        }
+
+        tracing::info!("recovery complete");
+
+        // match reader.read_superblocks() {
+        //     Ok(b) => {
+        //         tracing::info!(superblock=?b, "found superblock");
+        //     }
+        //     Err(error) => {
+        //         tracing::warn!(?error, "could not read superblocks");
+        //     }
+        // }
+
+        // reader.reader.seek(SeekFrom::Start(0))?;
+        // reader.offset = 0;
+        // // reader.skip_superblocks()?;
+
+        // tracing::info!("searching for log entries");
+
+        // let mut entry = None;
+        // let mut count = 0;
+
+        // let mut offset = reader.reader.stream_position()?;
+
+        // let sequence = config.start_sequence.unwrap_or(SequenceId::from_u64(1));
+        // tracing::info!(target_sequence=?sequence, "Trying to find start entry");
+        // reader.next_sequence = sequence;
+        // loop {
+        //     reader.reader.seek(SeekFrom::Start(offset))?;
+        //     reader.offset = offset;
+
+        //     match reader.next_entry() {
+        //         Ok(e) => {
+        //             if e.entry.header.sequence_id == sequence {
+        //                 entry = Some(e);
+        //                 tracing::info!(?sequence, "Found desired start entry");
+        //                 break;
+        //             } else {
+        //                 tracing::warn!(entry=?e, "Found entry, but not with the desired sequence");
+        //             }
+        //         }
+        //         Err(error) => {
+        //             if !error.to_string().contains("not decrypt") {
+        //                 tracing::trace!(%error, "could not read entry");
+        //             }
+        //         }
+        //     }
+        //     offset += 1;
+
+        //     if offset % 10000 == 0 {
+        //         tracing::trace!(
+        //             target_sequence=?sequence,
+        //             current_offset=%offset,
+        //             "still trying to find start entry"
+        //         );
+        //     }
+        // }
+
+        // loop {
+        //     match reader.next_entry() {
+        //         Ok(e) => {
+        //             entry = Some(e);
+        //             count += 1;
+        //         }
+        //         Err(error) => {
+        //             tracing::warn!(?error, count = count + 1, "Could not read entry");
+        //             break;
+        //         }
+        //     }
+        // }
+
+        // let last_entry = entry
+        //     .ok_or_else(|| LogFsError::new_internal("Could not find any restorable entries"))?;
+
+        // tracing::info!(
+        //     entry_count=count,
+        //     sequence_id=?last_entry.entry.header.sequence_id,
+        //     "Found entries that can be restored"
+        // );
+
+        // if config.dry_run {
+        //     return Ok(());
+        // }
+
+        // let tainted = TaintedFlag::new();
+
+        // let reader_pos = reader.reader.stream_position()?;
+        // let mut file = reader.reader.into_inner();
+        // file.seek(SeekFrom::Start(reader_pos))?;
+
+        // let superblock = IndexedSuperBlock {
+        //     block: data::Superblock {
+        //         format_version: data::LogFormatVersion::V2,
+        //         flags: data::SuperblockFlags::empty(),
+        //         tail_offset: reader_pos,
+        //         last_index_entry: None,
+        //         active_sequence: last_entry.entry.header.sequence_id.as_u64(),
+        //     },
+        //     index: 1,
+        // };
+        // let mut writer = LogWriter::open(crypto.clone(), tainted.clone(), file, superblock)?;
+        // writer.write_next_superblock()?;
+
+        // tracing::info!(
+        //     entry_count=count,
+        //     sequence_id=?last_entry.entry.header.sequence_id,
+        //     "Restored superblock"
+        // );
+
+        Ok(())
     }
 
     fn open_existing(
@@ -286,7 +677,7 @@ impl Journal2 {
 
         Ok(KeyPointer {
             sequence_id: entry.entry.header.sequence_id.as_u64(),
-            offset: entry.file_data_offset,
+            file_offset: entry.file_data_offset,
             size,
             chunk_size: chunk_size_opt,
         })
@@ -346,7 +737,7 @@ fn apply_entry(state: &mut crate::state::State, entry: PersistedEntry) -> Result
                 key.path,
                 KeyPointer {
                     sequence_id: entry.entry.header.sequence_id.as_u64(),
-                    offset: entry.file_data_offset,
+                    file_offset: entry.file_data_offset,
                     size: key.size,
                     chunk_size: key.chunk_size,
                 },
@@ -450,11 +841,20 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         Ok(block)
     }
 
+    fn skip_superblocks(&mut self) -> Result<(), LogFsError> {
+        self.reader.seek_relative(
+            data::Superblock::HEADER_COUNT as i64 * data::Superblock::SERIALIZED_LEN as i64,
+        )?;
+        Ok(())
+    }
+
     fn next_entry(&mut self) -> Result<PersistedEntry, LogFsError> {
         let chunk_padding = self.crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as usize;
         let start_offset = self.offset;
         let buffer = &mut self.buffer;
         let sequence = self.next_sequence;
+
+        debug_assert_eq!(self.reader.stream_position()?, start_offset);
 
         let header_size = data::JournalEntryHeader::SERIALIZED_LEN + chunk_padding;
 
@@ -469,11 +869,12 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             &buffer
         };
         let header: data::JournalEntryHeader = bincode::deserialize(&header_data)?;
+        tracing::trace!(?header, "read entry header");
 
-        if self.next_sequence != header.sequence_id {
+        if sequence != header.sequence_id {
             return Err(LogFsError::new_internal(format!(
                 "Corrupted log: log entry sequence number for sequence {:?}",
-                self.next_sequence
+                sequence,
             )));
         }
         if start_offset != header.offset {
@@ -500,17 +901,8 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         };
 
         let action: data::JournalAction = bincode::deserialize(action_data)?;
-
-        let data_len = match &action {
-            data::JournalAction::KeyInsert(key) => {
-                key.meta.size + (chunk_padding as u64 * key.meta.chunk_count() as u64)
-            }
-            data::JournalAction::KeyRename(_) => 0,
-            data::JournalAction::KeyDelete(_) => 0,
-            data::JournalAction::IndexWrite(w) => w.size as u64 + chunk_padding as u64,
-        };
-        self.reader
-            .seek(std::io::SeekFrom::Current(data_len as i64))?;
+        let data_len = action.payload_len(self.crypto.clone());
+        self.reader.seek(SeekFrom::Current(data_len as i64))?;
 
         let data_offset = start_offset + header_size as u64 + action_size as u64;
         let next_entry_offset = data_offset + data_len;
@@ -565,9 +957,8 @@ impl LogWriter {
         };
 
         s.create_superblocks()?;
-        s.writer.seek(std::io::SeekFrom::Start(
-            s.active_superblock.block.tail_offset,
-        ))?;
+        s.writer
+            .seek(SeekFrom::Start(s.active_superblock.block.tail_offset))?;
 
         Ok(s)
     }
@@ -580,7 +971,7 @@ impl LogWriter {
     ) -> Result<Self, LogFsError> {
         assert!(block.index < data::Superblock::HEADER_COUNT as usize);
 
-        file.seek(std::io::SeekFrom::Start(block.block.tail_offset))?;
+        file.seek(SeekFrom::Start(block.block.tail_offset))?;
 
         let s = Self {
             crypto,
@@ -674,11 +1065,11 @@ impl LogWriter {
 
         let offset = block.index as u64 * data::Superblock::SERIALIZED_LEN;
 
-        self.writer.seek(std::io::SeekFrom::Start(offset))?;
+        self.writer.seek(SeekFrom::Start(offset))?;
         self.writer.write_all(&buffer)?;
         self.writer.flush()?;
 
-        self.writer.seek(std::io::SeekFrom::Start(self.offset))?;
+        self.writer.seek(SeekFrom::Start(self.offset))?;
 
         self.active_superblock = block;
 
@@ -700,7 +1091,10 @@ impl LogWriter {
                 self.tainted.set_tainted();
                 Err(err)
             }
-            other => other,
+            Ok(e) => {
+                tracing::trace!(entry=?e, "wrote journal entry");
+                Ok(e)
+            }
         }
     }
 
@@ -925,9 +1319,7 @@ impl LogChunkWriter {
 
         let mut writer = self.writer;
         let end_offset = writer.offset;
-        writer
-            .writer
-            .seek(std::io::SeekFrom::Start(self.header.offset))?;
+        writer.writer.seek(SeekFrom::Start(self.header.offset))?;
         writer.offset = self.header.offset;
         writer.incomplete_entry_in_progress = false;
         let header = writer.write_action(&action, false)?;
@@ -940,7 +1332,7 @@ impl LogChunkWriter {
 
         let pointer = KeyPointer {
             sequence_id: writer.next_sequence.as_u64(),
-            offset: writer.offset,
+            file_offset: writer.offset,
             size: self.data_size,
             chunk_size: Some(self.chunk_size),
         };
@@ -1055,7 +1447,7 @@ impl KeyDataReader {
         pointer: &KeyPointer,
         mut file: std::fs::File,
     ) -> Result<Self, LogFsError> {
-        file.seek(std::io::SeekFrom::Start(pointer.offset))?;
+        file.seek(SeekFrom::Start(pointer.file_offset))?;
         let reader = BufReader::new(file);
         let chunk_count = pointer
             .chunk_size
@@ -1137,6 +1529,10 @@ impl KeyDataReader {
 
     fn is_finished(&self) -> bool {
         self.next_chunk > self.last_chunk_index
+    }
+
+    fn close(self) -> std::fs::File {
+        self.reader.into_inner()
     }
 }
 
@@ -1234,8 +1630,30 @@ impl super::JournalStore for Journal2 {
         Journal2::open(path, state, crypto, config)
     }
 
+    fn repair(
+        log_config: &LogConfig,
+        crypto: Option<Arc<Crypto>>,
+        repair_config: super::RepairConfig,
+    ) -> Result<(), LogFsError>
+    where
+        Self: Sized,
+    {
+        Journal2::repair(log_config, crypto, repair_config)
+    }
+
     fn write_insert(&self, path: crate::Path, data: Vec<u8>) -> Result<KeyPointer, LogFsError> {
         self.write_insert(path, data, self.default_chunk_size)
+    }
+
+    fn insert_writer(&self, path: crate::Path, tree: SharedTree) -> Result<KeyWriter, LogFsError> {
+        let writer = self.state.acquire_borrowed_writer()?;
+        Ok(KeyWriter::new(LogChunkWriter::new(
+            tree,
+            self.state.clone(),
+            writer,
+            self.default_chunk_size,
+            path,
+        )?))
     }
 
     fn write_rename(&self, old_path: crate::Path, new_path: crate::Path) -> Result<(), LogFsError> {
@@ -1248,17 +1666,6 @@ impl super::JournalStore for Journal2 {
 
     fn read_data(&self, pointer: &KeyPointer) -> Result<Vec<u8>, LogFsError> {
         self.read_data(pointer)
-    }
-
-    fn insert_writer(&self, path: crate::Path, tree: SharedTree) -> Result<KeyWriter, LogFsError> {
-        let writer = self.state.acquire_borrowed_writer()?;
-        Ok(KeyWriter::new(LogChunkWriter::new(
-            tree,
-            self.state.clone(),
-            writer,
-            self.default_chunk_size,
-            path,
-        )?))
     }
 
     fn reader(&self, pointer: &KeyPointer) -> Result<StdKeyReader, LogFsError> {
