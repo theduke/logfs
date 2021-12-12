@@ -102,6 +102,12 @@ struct Inner<J> {
     journal: J,
 }
 
+#[derive(Clone, Debug)]
+pub struct KeyMeta {
+    pub size: u64,
+    pub chunk_size: Option<u32>,
+}
+
 type DataOffset = u64;
 
 impl<J: JournalStore> LogFs<J> {
@@ -156,6 +162,16 @@ impl<J: JournalStore> LogFs<J> {
             .read()
             .unwrap()
             .redundant_data_bytes_estimate()
+    }
+
+    pub fn get_meta(&self, path: impl AsRef<str>) -> Result<Option<KeyMeta>, LogFsError> {
+        match self.inner.state.read().unwrap().get_key(path.as_ref()) {
+            Some(pointer) => Ok(Some(KeyMeta {
+                size: pointer.size,
+                chunk_size: pointer.chunk_size,
+            })),
+            None => Ok(None),
+        }
     }
 
     /// Get a key.
@@ -564,5 +580,41 @@ mod tests {
         assert_eq!(&all, data.as_bytes());
 
         Ok(())
+    }
+
+    #[test]
+    fn test_chunk_iter() {
+        let db = test_db::<Journal2>("chunk_iter");
+
+        let data = "000111222333444555666777888999";
+        let path = "a";
+        db.insert(path, data.as_bytes().to_vec()).unwrap();
+
+        assert_eq!(&db.get(&path).unwrap().unwrap(), data.as_bytes());
+
+        let mut chunks = db.get_chunks(&path).unwrap();
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"000");
+
+        chunks.skip_bytes(6).unwrap();
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"333");
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"444");
+
+        // Partial chunk seek.
+        chunks.skip_bytes(2).unwrap();
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"5");
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"666");
+
+        chunks.skip_bytes(1).unwrap();
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"77");
+
+        // assert_eq!(&chunks.next().unwrap().unwrap(), b"888");
+        // assert_eq!(&chunks.next().unwrap().unwrap(), b"999");
+
+        chunks.skip_bytes(5).unwrap();
+        assert_eq!(&chunks.next().unwrap().unwrap(), b"9");
+
+        assert!(chunks.next().is_none());
+
+        assert!(chunks.skip_bytes(6).is_err());
     }
 }

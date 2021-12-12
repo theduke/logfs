@@ -8,7 +8,7 @@ use sha2::Digest;
 use crate::{
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
-    LogConfig, LogFsError,
+    DataOffset, LogConfig, LogFsError,
 };
 
 use self::data::{ByteCountU64, Offset};
@@ -1432,10 +1432,12 @@ pub struct KeyDataReader {
     crypto: Option<Arc<Crypto>>,
     reader: BufReader<std::fs::File>,
     sequence: SequenceId,
+    file_offset: DataOffset,
     chunk_size: usize,
     total_size: u64,
     last_chunk_index: data::ChunkIndex,
     last_chunk_size: usize,
+    chunk_count: u32,
 
     next_chunk: data::ChunkIndex,
 }
@@ -1462,6 +1464,7 @@ impl KeyDataReader {
         Ok(Self {
             crypto,
             reader,
+            file_offset: pointer.file_offset,
             sequence: SequenceId::from_u64(pointer.sequence_id),
             chunk_size: pointer
                 .chunk_size
@@ -1469,6 +1472,7 @@ impl KeyDataReader {
                 .unwrap_or(pointer.size as usize),
             total_size: pointer.size,
             last_chunk_index,
+            chunk_count,
             last_chunk_size,
             next_chunk: ENTRY_FIRST_DATA_CHUNK,
         })
@@ -1524,6 +1528,26 @@ impl KeyDataReader {
         self.next_chunk = self.next_chunk + 1;
 
         Ok(data)
+    }
+
+    fn skip_chunks(&mut self, count: u32) -> Result<(), LogFsError> {
+        let target_chunk = self.next_chunk + count;
+        if target_chunk > self.last_chunk_index {
+            return Err(LogFsError::new_internal("Chunk index out of range"));
+        }
+
+        let padding = self
+            .crypto
+            .as_ref()
+            .map(|c| c.extra_payload_len() as usize)
+            .unwrap_or_default();
+
+        let bytes_to_skip = count as u64 * (self.chunk_size as u64 + padding as u64);
+        self.reader
+            .seek(std::io::SeekFrom::Current(bytes_to_skip as i64))?;
+        self.next_chunk = target_chunk;
+
+        Ok(())
     }
 
     fn is_finished(&self) -> bool {
@@ -1596,11 +1620,34 @@ impl std::io::Read for StdKeyReader {
 
 pub struct KeyChunkIter {
     reader: KeyDataReader,
+    /// Buffer for partial chunks.
+    /// Required when Self::seek targets a partial chunk.
+    partial_buffer: Option<Vec<u8>>,
 }
 
 impl KeyChunkIter {
     pub fn new(reader: KeyDataReader) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            partial_buffer: None,
+        }
+    }
+
+    pub fn skip_bytes(&mut self, offset: u64) -> Result<(), LogFsError> {
+        let to_skip = u32::try_from(offset as u64 / self.reader.chunk_size as u64)
+            .map_err(|_| LogFsError::new_internal("Seek out of bounds"))?;
+        self.reader.skip_chunks(to_skip)?;
+
+        let partial = (offset % self.reader.chunk_size as u64) as usize;
+        if partial > 0 {
+            // Partial chunk read.
+            // Need to read and buffer the next chunk.
+            let mut data = self.reader.read_next_chunk(Vec::new())?;
+            data.drain(..partial);
+            debug_assert!(!data.is_empty());
+            self.partial_buffer = Some(data);
+        }
+        Ok(())
     }
 }
 
@@ -1608,7 +1655,9 @@ impl Iterator for KeyChunkIter {
     type Item = Result<Vec<u8>, LogFsError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.reader.is_finished() {
+        if let Some(partial) = self.partial_buffer.take() {
+            Some(Ok(partial))
+        } else if self.reader.is_finished() {
             None
         } else {
             Some(self.reader.read_next_chunk(Vec::new()))
