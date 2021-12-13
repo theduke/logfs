@@ -16,6 +16,13 @@ enum Subcommand {
     Get {
         key: String,
     },
+    Search {
+        text: String,
+        #[structopt(long)]
+        keys_only: bool,
+        #[structopt(long)]
+        delete: bool,
+    },
     Set {
         key: String,
         /// The value to set for the key.
@@ -23,7 +30,7 @@ enum Subcommand {
         value: String,
     },
     Delete {
-        key: String,
+        keys: Vec<String>,
     },
     Migrate {
         #[structopt(long)]
@@ -40,6 +47,8 @@ enum Subcommand {
         overwrite: bool,
         #[structopt(long)]
         start_sequence: Option<u64>,
+        #[structopt(long)]
+        skip_bytes: Option<u64>,
         #[structopt(long)]
         recovery_path: Option<String>,
     },
@@ -129,6 +138,36 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 }
             }
         }
+        Subcommand::Search {
+            text,
+            keys_only,
+            delete,
+        } => {
+            let db = logfs::LogFs::<J>::open(opt.build_config())?;
+
+            for key in db.paths_range(..)? {
+                let meta = db.get_meta(&key)?.unwrap();
+                if meta.size > 100_000 {
+                    continue;
+                }
+                let content = db.get(&key)?.unwrap();
+                let s = String::from_utf8_lossy(&content);
+
+                if s.contains(&text) {
+                    if delete {
+                        db.remove(&key)?;
+                        eprintln!("Deleted: {key}\n");
+                    }
+                    if keys_only {
+                        print!("{key} ");
+                    } else {
+                        eprintln!("Match {key}:\n{s}\n\n");
+                    }
+                }
+            }
+
+            Ok(())
+        }
         Subcommand::Set { key, value } => {
             let db = logfs::LogFs::<J>::open(opt.build_config())?;
 
@@ -140,16 +179,19 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 db.insert(key, value.into_bytes())
             }
         }
-        Subcommand::Delete { key } => {
+        Subcommand::Delete { keys } => {
             let db = logfs::LogFs::<J>::open(opt.build_config())?;
 
-            if db.get(&key).is_ok() {
-                db.remove(&key)?;
-                eprintln!("Key '{}' deleted", key);
-            } else {
-                eprintln!("Error: Key '{}' does not exist", key);
-                std::process::exit(1);
+            for key in keys {
+                if db.get(&key).is_ok() {
+                    db.remove(&key)?;
+                    eprintln!("Key '{}' deleted", key);
+                } else {
+                    eprintln!("Error: Key '{}' does not exist", key);
+                    std::process::exit(1);
+                }
             }
+
             Ok(())
         }
         Subcommand::Migrate { .. } => {
@@ -160,6 +202,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             overwrite,
             start_sequence,
             recovery_path,
+            skip_bytes,
         } => {
             std::env::set_var("RUST_LOG", "logfs=trace");
             tracing_subscriber::fmt::init();
@@ -170,6 +213,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 dry_run,
                 start_sequence,
                 recovery_path: recovery_path.map(std::path::PathBuf::from),
+                skip_bytes,
             };
             logfs::LogFs::<logfs::Journal2>::repair(config, r)
         }
