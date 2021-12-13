@@ -81,6 +81,7 @@ pub struct RepairConfig {
     pub start_sequence: Option<u64>,
     /// The path to which a recovered log should be written.
     pub recovery_path: Option<PathBuf>,
+    pub skip_bytes: Option<u64>,
 }
 
 pub struct LogFs<J = journal::Journal2> {
@@ -143,6 +144,7 @@ impl<J: JournalStore> LogFs<J> {
                 dry_run: repair_config.dry_run,
                 start_sequence: repair_config.start_sequence.map(SequenceId::from_u64),
                 recovery_path: repair_config.recovery_path,
+                skip_bytes: repair_config.skip_bytes,
             },
         )?;
 

@@ -121,6 +121,9 @@ fn find_entry_header_in_slice(
             data::JournalEntryHeader::SERIALIZED_LEN + crypto.extra_payload_len() as usize;
 
         for index in 0..=(data.len() - header_len) {
+            if index % 100_000 == 0 {
+                tracing::trace!(chunk_index=%index, "trying ty find entry");
+            }
             let mut slice = data[index..index + header_len].to_vec();
             let decrypted =
                 match crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_HEADER_CHUNK, &mut slice) {
@@ -315,7 +318,9 @@ impl Journal2 {
         let mut f = std::fs::File::open(&log_config.path)?;
         let file_size = determine_file_size(&mut f)?;
 
-        f.seek(SeekFrom::Start(0))?;
+        let mut file_offset = config.skip_bytes.unwrap_or_default();
+
+        f.seek(SeekFrom::Start(file_offset))?;
         let mut reader = BufReader::new(f);
 
         // let _superblock = match reader.read_superblocks() {
@@ -327,7 +332,6 @@ impl Journal2 {
         // };
 
         let sequence = config.start_sequence.unwrap_or(SequenceId::from_u64(1));
-        let mut file_offset = 0;
         let mut buffer = Vec::new();
 
         let mut entry_and_offset = None;

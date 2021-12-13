@@ -53,6 +53,7 @@ impl SequenceId {
 pub struct RepairConfig {
     pub dry_run: bool,
     pub start_sequence: Option<SequenceId>,
+    pub skip_bytes: Option<u64>,
     /// The path to which a recovered log should be written.
     pub recovery_path: Option<PathBuf>,
 }
