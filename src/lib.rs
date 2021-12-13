@@ -4,7 +4,7 @@ pub use self::error::LogFsError;
 mod journal;
 mod state;
 use journal::{
-    v2::{KeyChunkIter, StdKeyReader},
+    v2::read::{KeyChunkIter, StdKeyReader},
     SequenceId,
 };
 pub use journal::{Journal2, JournalStore};
@@ -247,7 +247,7 @@ impl<J: JournalStore> LogFs<J> {
     pub fn insert_writer(
         &self,
         path: impl Into<String>,
-    ) -> Result<journal::v2::KeyWriter, LogFsError> {
+    ) -> Result<journal::v2::write::KeyWriter, LogFsError> {
         self.inner
             .journal
             .insert_writer(path.into(), self.inner.state.clone())

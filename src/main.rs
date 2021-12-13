@@ -33,14 +33,16 @@ enum Subcommand {
         keys: Vec<String>,
     },
     Migrate {
-        #[structopt(long)]
-        new_path: Option<String>,
-        #[structopt(long)]
-        new_key: Option<String>,
-        #[structopt(long)]
-        new_salt: Option<String>,
-        #[structopt(long)]
-        new_iterations: Option<u32>,
+        // Commented out because there currently is only one log version in the
+    // codebase.
+    // #[structopt(long)]
+    // new_path: Option<String>,
+    // #[structopt(long)]
+    // new_key: Option<String>,
+    // #[structopt(long)]
+    // new_salt: Option<String>,
+    // #[structopt(long)]
+    // new_iterations: Option<u32>,
     },
     Repair {
         #[structopt(long)]

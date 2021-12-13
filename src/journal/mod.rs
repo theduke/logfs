@@ -9,7 +9,10 @@ use crate::{
     LogConfig, LogFsError,
 };
 
-use self::v2::{KeyChunkIter, KeyWriter, StdKeyReader};
+use self::v2::{
+    read::{KeyChunkIter, StdKeyReader},
+    write::KeyWriter,
+};
 
 use super::Path;
 
