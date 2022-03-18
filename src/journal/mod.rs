@@ -92,4 +92,6 @@ pub trait JournalStore {
     fn reader(&self, pointer: &KeyPointer) -> Result<StdKeyReader, LogFsError>;
 
     fn read_chunks(&self, pointer: &KeyPointer) -> Result<KeyChunkIter, LogFsError>;
+
+    fn size_log(&self) -> Result<u64, LogFsError>;
 }

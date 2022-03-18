@@ -52,6 +52,10 @@ pub(crate) struct LogWriter {
 }
 
 impl LogWriter {
+    pub(crate) fn offset(&self) -> data::Offset {
+        self.offset
+    }
+
     pub(crate) fn create_new(
         crypto: Option<Arc<Crypto>>,
         tainted: TaintedFlag,

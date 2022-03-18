@@ -308,6 +308,23 @@ impl<J: JournalStore> LogFs<J> {
 
         Ok(())
     }
+
+    pub fn size_data(&self) -> Result<u64, LogFsError> {
+        let size = self
+            .inner
+            .state
+            .read()
+            .unwrap()
+            .tree
+            .values()
+            .map(|v| v.size)
+            .sum();
+        Ok(size)
+    }
+
+    pub fn size_log(&self) -> Result<u64, LogFsError> {
+        self.inner.journal.size_log()
+    }
 }
 
 impl LogFs<Journal2> {

@@ -569,4 +569,18 @@ impl super::JournalStore for Journal2 {
     fn read_chunks(&self, pointer: &KeyPointer) -> Result<read::KeyChunkIter, LogFsError> {
         Journal2::chunk_iter(&self, pointer)
     }
+
+    fn size_log(&self) -> Result<u64, LogFsError> {
+        let writer = self
+            .state
+            .writer
+            .lock()
+            .map_err(|_| LogFsError::new_internal("Could not retrieve log writer"))?;
+        match &*writer {
+            WriterState::Closed | WriterState::Available(None) => {
+                Err(LogFsError::new_internal("Writer not available"))
+            }
+            WriterState::Available(Some(w)) => Ok(w.offset()),
+        }
+    }
 }
