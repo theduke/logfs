@@ -222,7 +222,7 @@ impl KeyDataReader {
 
         let size = if is_last {
             if self.last_chunk_index == ENTRY_FIRST_DATA_CHUNK {
-                self.chunk_size
+                self.total_size as usize
             } else {
                 (self.total_size
                     - (self.last_chunk_index - ENTRY_FIRST_DATA_CHUNK) as u64
@@ -312,7 +312,6 @@ impl std::io::Read for StdKeyReader {
             } else {
                 self.buffer_offset += to_write;
             }
-            eprintln!("read {to_write} from std reader");
             return Ok(to_write);
         }
 
