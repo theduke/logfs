@@ -493,13 +493,21 @@ impl KeyWriter {
     }
 
     pub fn finish(mut self) -> Result<(), LogFsError> {
+        self.finish_mut()
+    }
+
+    // Only called in Self::drop as a workaround.
+    fn finish_mut(&mut self) -> Result<(), LogFsError> {
         let final_data = if self.buffer_offset > 0 {
             self.buffer.truncate(self.buffer_offset);
             Some(&mut self.buffer)
         } else {
             None
         };
-        self.writer.take().unwrap().finalize(final_data)
+        self.writer
+            .take()
+            .expect("writer must be available")
+            .finalize(final_data)
     }
 }
 
@@ -549,7 +557,9 @@ impl std::io::Write for KeyWriter {
 impl Drop for KeyWriter {
     fn drop(&mut self) {
         if self.writer.is_some() {
-            panic!("Unfinished KeyWriter dropped. Must call KeyWriter::finish()");
+            self.finish_mut().expect(
+                "Drop handler for KeyWriter failed - you should always call KeyWriter::finish()",
+            );
         }
     }
 }
