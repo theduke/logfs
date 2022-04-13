@@ -300,44 +300,48 @@ impl StdKeyReader {
 
 impl std::io::Read for StdKeyReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(mut reader) = self.reader.take() {
-            if self.buffer.is_empty() {
-                let res = reader.read_next_chunk(std::mem::take(&mut self.buffer));
-
-                match res {
-                    Ok(buf) => {
-                        self.buffer = buf;
-                        self.buffer_offset = 0;
-                        self.reader = if reader.next_chunk <= reader.last_chunk_index {
-                            Some(reader)
-                        } else {
-                            None
-                        };
-                    }
-                    Err(err) => {
-                        self.reader = Some(reader);
-                        return Err(err.into_io());
-                    }
-                }
-            } else {
-                self.reader = Some(reader);
-            }
-
+        if !self.buffer.is_empty() {
             let remaining_in_buffer = self.buffer.len() - self.buffer_offset;
 
             let to_write = std::cmp::min(buf.len(), remaining_in_buffer);
             buf[0..to_write]
                 .copy_from_slice(&self.buffer[self.buffer_offset..self.buffer_offset + to_write]);
 
-            if self.buffer_offset + to_write >= self.buffer.len() {
+            if to_write >= remaining_in_buffer {
                 self.buffer.clear();
             } else {
                 self.buffer_offset += to_write;
             }
-            Ok(to_write)
-        } else {
-            Ok(0)
+            eprintln!("read {to_write} from std reader");
+            return Ok(to_write);
         }
+
+        let mut reader = if let Some(reader) = self.reader.take() {
+            reader
+        } else {
+            return Ok(0);
+        };
+
+        let res = reader.read_next_chunk(std::mem::take(&mut self.buffer));
+
+        match res {
+            Ok(new_buffer) => {
+                self.buffer = new_buffer;
+                self.buffer_offset = 0;
+                self.reader = if reader.next_chunk <= reader.last_chunk_index {
+                    Some(reader)
+                } else {
+                    None
+                };
+
+                self.read(buf)
+            }
+            Err(err) => {
+                self.reader = Some(reader);
+                Err(err.into_io())
+            }
+        }
+        // FIXME: write tests!
     }
 }
 
