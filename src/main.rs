@@ -3,6 +3,7 @@ use std::{
     num::NonZeroU32,
 };
 
+use logfs::{CryptoConfig, KeyMeta, LogConfig};
 use structopt::StructOpt;
 
 #[derive(StructOpt, Clone)]
@@ -31,6 +32,18 @@ enum Subcommand {
     },
     Delete {
         keys: Vec<String>,
+    },
+    /// Compat the log into a new location.
+    Compact {
+        #[structopt(long)]
+        new_path: String,
+        #[structopt(long)]
+        new_key: String,
+        #[structopt(long)]
+        new_salt: String,
+        #[structopt(long)]
+        new_key_iterations: u32,
+        new_offset: Option<u64>,
     },
     Migrate {
         // Commented out because there currently is only one log version in the
@@ -223,6 +236,80 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 skip_bytes,
             };
             logfs::LogFs::<logfs::Journal2>::repair(config, r)
+        }
+        Subcommand::Compact {
+            new_path,
+            new_key,
+            new_salt,
+            new_key_iterations,
+            new_offset,
+        } => {
+            eprintln!("Opening old database...");
+            let old_db = logfs::LogFs::<J>::open(opt.build_config())?;
+
+            eprintln!("Creating new database...");
+
+            let new_config = LogConfig {
+                path: new_path.into(),
+                raw_mode: false,
+                offset: new_offset,
+                allow_create: true,
+                crypto: Some(CryptoConfig {
+                    key: new_key.into(),
+                    salt: new_salt.into_bytes().into(),
+                    iterations: NonZeroU32::new(new_key_iterations)
+                        .expect("iterations must be > 0"),
+                }),
+                default_chunk_size: 4_000_000,
+            };
+
+            let new_db =
+                logfs::LogFs::<J>::open(new_config).expect("Could not open new database...");
+            let all_keys = old_db.paths_range(..).expect("Could not obtain old keys");
+
+            let keys_plus_size: Vec<(String, KeyMeta)> = all_keys
+                .into_iter()
+                .map(|key| {
+                    let meta = old_db.get_meta(&key).unwrap().unwrap();
+                    (key, meta)
+                })
+                .collect();
+
+            let total_size: u64 = keys_plus_size.iter().map(|(_, m)| m.size).sum();
+            let total_count = keys_plus_size.len();
+
+            eprintln!(
+                "copying {} keys with a total size of {}",
+                total_count, total_size
+            );
+
+            let mut finished_size = 0.0;
+            let total_size = total_size as f64;
+            for (index, (key, meta)) in keys_plus_size.into_iter().enumerate() {
+                eprintln!(
+                    "count: {}/{} total_size_pct: {} - {}",
+                    index + 1,
+                    total_count,
+                    ((finished_size / total_size) * 10000.0).round() / 100.0,
+                    key
+                );
+
+                // Keys smaller than 100mb: just load them into memory
+                if meta.size < 100_000_000 {
+                    let value = old_db.get(&key).unwrap().unwrap();
+                    new_db.insert(key, value).unwrap();
+                } else {
+                    let mut reader = old_db.get_reader(&key).unwrap();
+                    let mut writer = new_db.insert_writer(&key).unwrap();
+                    std::io::copy(&mut reader, &mut writer).unwrap();
+                }
+
+                finished_size += meta.size as f64;
+            }
+
+            eprintln!("Complete!");
+
+            Ok(())
         }
     }
 }
