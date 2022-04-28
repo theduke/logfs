@@ -11,6 +11,7 @@ use super::{
 };
 
 pub struct LogReader<'a, R> {
+    base_offset: u64,
     offset: u64,
     // TODO: should be private!
     pub next_sequence: SequenceId,
@@ -21,9 +22,10 @@ pub struct LogReader<'a, R> {
 }
 
 impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
-    pub fn new_start(reader: R, crypto: Option<&'a Crypto>) -> Self {
+    pub fn new_start(reader: R, base_offset: u64, crypto: Option<&'a Crypto>) -> Self {
         Self {
-            offset: 0,
+            base_offset,
+            offset: base_offset,
             next_sequence: SequenceId::first(),
             crypto,
             buffer: Vec::new(),
@@ -33,6 +35,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
 
     pub(super) fn read_superblocks(&mut self) -> Result<IndexedSuperBlock, LogFsError> {
         let mut best_block: Option<IndexedSuperBlock> = None;
+        debug_assert_eq!(self.reader.stream_position().unwrap(), self.base_offset);
 
         let mut buf = Vec::new();
         for index in 0..data::Superblock::HEADER_COUNT {
@@ -73,7 +76,10 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         let block =
             best_block.ok_or_else(|| LogFsError::new_internal("Could not find a superblock"))?;
         self.offset = self.reader.stream_position()?;
-        debug_assert_eq!(self.offset, data::Superblock::HEADER_SIZE);
+        debug_assert_eq!(
+            self.offset,
+            data::Superblock::HEADER_SIZE + self.base_offset
+        );
 
         Ok(block)
     }
@@ -114,7 +120,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
                 sequence,
             )));
         }
-        if start_offset != header.offset {
+        if start_offset - self.base_offset != header.offset {
             return Err(LogFsError::new_internal(format!(
                 "Corrupted log: log entry offset does not match actual offset for sequence {:?}",
                 self.next_sequence

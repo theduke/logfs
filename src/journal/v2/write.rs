@@ -38,6 +38,10 @@ impl TaintedFlag {
 }
 
 pub(crate) struct LogWriter {
+    /// Offset inside the file.
+    /// Needed when the config specifies that the db should start at an offset.
+    base_offset: u64,
+
     crypto: Option<Arc<Crypto>>,
     next_sequence: SequenceId,
     offset: data::Offset,
@@ -60,11 +64,13 @@ impl LogWriter {
         crypto: Option<Arc<Crypto>>,
         tainted: TaintedFlag,
         file: std::fs::File,
+        base_offset: u64,
     ) -> Result<Self, LogFsError> {
         let mut s = Self {
+            base_offset,
             crypto,
             next_sequence: SequenceId::first(),
-            offset: data::Superblock::HEADER_SIZE,
+            offset: base_offset + data::Superblock::HEADER_SIZE,
             writer: BufWriter::new(file),
             incomplete_entry_in_progress: false,
             active_superblock: IndexedSuperBlock {
@@ -82,8 +88,9 @@ impl LogWriter {
         };
 
         s.create_superblocks()?;
-        s.writer
-            .seek(SeekFrom::Start(s.active_superblock.block.tail_offset))?;
+        s.writer.seek(SeekFrom::Start(
+            base_offset + s.active_superblock.block.tail_offset,
+        ))?;
 
         Ok(s)
     }
@@ -92,16 +99,18 @@ impl LogWriter {
         crypto: Option<Arc<Crypto>>,
         tainted: TaintedFlag,
         mut file: std::fs::File,
+        base_offset: u64,
         block: IndexedSuperBlock,
     ) -> Result<Self, LogFsError> {
         assert!(block.index < data::Superblock::HEADER_COUNT as usize);
 
-        file.seek(SeekFrom::Start(block.block.tail_offset))?;
+        file.seek(SeekFrom::Start(base_offset + block.block.tail_offset))?;
 
         let s = Self {
+            base_offset,
             crypto,
             next_sequence: SequenceId::from_u64(block.block.active_sequence + 1),
-            offset: block.block.tail_offset,
+            offset: base_offset + block.block.tail_offset,
             incomplete_entry_in_progress: false,
             writer: BufWriter::new(file),
             actions_since_last_index_write: block
@@ -129,12 +138,13 @@ impl LogWriter {
 
     fn create_superblocks(&mut self) -> Result<(), LogFsError> {
         assert_eq!(self.next_sequence, SequenceId::first());
-        assert_eq!(self.writer.stream_position()?, 0);
+        assert_eq!(self.writer.stream_position()?, self.base_offset);
 
         for _ in 0..data::Superblock::HEADER_COUNT {
             self.write_next_superblock()?;
         }
-        self.offset = data::Superblock::HEADER_SIZE;
+        self.offset = self.base_offset + data::Superblock::HEADER_SIZE;
+        debug_assert_eq!(self.offset, self.writer.stream_position().unwrap());
 
         Ok(())
     }
@@ -152,7 +162,7 @@ impl LogWriter {
                 format_version: self.active_superblock.block.format_version,
                 flags: self.active_superblock.block.flags,
                 active_sequence: self.next_sequence.as_u64() - 1,
-                tail_offset: self.offset,
+                tail_offset: self.offset - self.base_offset,
                 last_index_entry: self.active_superblock.block.last_index_entry.clone(),
             },
         };
@@ -174,7 +184,7 @@ impl LogWriter {
 
         debug_assert_eq!(self.incomplete_entry_in_progress, false);
         debug_assert_eq!(block.block.active_sequence, self.next_sequence.as_u64() - 1);
-        debug_assert_eq!(block.block.tail_offset, self.offset);
+        debug_assert_eq!(block.block.tail_offset, self.offset - self.base_offset);
         if let Some(ptr) = &block.block.last_index_entry {
             debug_assert!(ptr.sequence < self.next_sequence);
         }
@@ -188,7 +198,7 @@ impl LogWriter {
         }
         debug_assert_eq!(buffer.len(), data::Superblock::SERIALIZED_LEN as usize);
 
-        let offset = block.index as u64 * data::Superblock::SERIALIZED_LEN;
+        let offset = self.base_offset + block.index as u64 * data::Superblock::SERIALIZED_LEN;
 
         self.writer.seek(SeekFrom::Start(offset))?;
         self.writer.write_all(&buffer)?;
@@ -231,6 +241,8 @@ impl LogWriter {
         incomplete: bool,
     ) -> Result<PersistedEntry, LogFsError> {
         let sequence = self.next_sequence;
+
+        debug_assert_eq!(self.writer.stream_position().unwrap(), self.offset);
         let header = self.write_action(&action, incomplete)?;
 
         let data_offset = self.offset;
@@ -282,7 +294,7 @@ impl LogWriter {
             data::JournalEntryHeaderFlags::empty()
         };
         let header = data::JournalEntryHeader {
-            offset: self.offset,
+            offset: self.offset - self.base_offset,
             sequence_id: sequence,
             action_size: action_data_len as u32,
             flags,
@@ -297,6 +309,7 @@ impl LogWriter {
         self.writer.write_all(&action_data)?;
 
         self.offset += header_data.len() as u64 + action_data.len() as u64;
+        debug_assert_eq!(self.writer.stream_position().unwrap(), self.offset);
         self.incomplete_entry_in_progress = true;
 
         Ok(header)

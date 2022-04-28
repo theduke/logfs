@@ -30,6 +30,7 @@ impl ConfigBuilder {
         Self {
             config: LogConfig {
                 path: path.into(),
+                offset: None,
                 allow_create: false,
                 raw_mode: false,
                 crypto: None,
@@ -40,6 +41,11 @@ impl ConfigBuilder {
 
     pub fn raw_mode(mut self) -> Self {
         self.config.raw_mode = true;
+        self
+    }
+
+    pub fn offset(mut self, offset: u64) -> Self {
+        self.config.offset = Some(offset);
         self
     }
 
@@ -66,6 +72,8 @@ impl ConfigBuilder {
 pub struct LogConfig {
     pub path: PathBuf,
     pub raw_mode: bool,
+    /// Optional file offset where the DB should start.
+    pub offset: Option<u64>,
     pub allow_create: bool,
     pub crypto: Option<crypto::CryptoConfig>,
     /// Data is chunked into separate slices, which allows incrementally reading
@@ -347,6 +355,7 @@ mod tests {
     fn test_config(name: &str) -> LogConfig {
         LogConfig {
             path: temp_test_dir(name),
+            offset: None,
             raw_mode: false,
             allow_create: true,
             crypto: Some(CryptoConfig {
@@ -422,6 +431,76 @@ mod tests {
 
         assert_eq!(log3.get(key3_a).unwrap(), None);
         assert_eq!(&log3.get(key3_b).unwrap().unwrap(), &content3);
+    }
+
+    #[test]
+    fn test_full_flow_with_offset() {
+        let header_content: &[u8] = b"this is a long header in the filer that must not be touched !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! Ok?";
+
+        let mut config = test_config("full_flow_with_offset");
+        config.offset = Some(header_content.len() as u64);
+        config.allow_create = true;
+
+        // create the file up to the offset.
+
+        {
+            let mut f = std::fs::File::create(&config.path).unwrap();
+            f.write_all(header_content).unwrap();
+        }
+
+        let log = LogFs::<Journal2>::open(config.clone()).unwrap();
+
+        let key1 = "a/b/c";
+        let content1 = b"hello there".to_vec();
+
+        let key2 = "x";
+        let content2 = b"xyz".to_vec();
+
+        let key3_a = "rename/first";
+        let key3_b = "rename/second";
+        let content3 = b"key3!".to_vec();
+
+        // Just insert some keys first.
+
+        log.insert(key1, content1.clone()).unwrap();
+        assert_eq!(log.get(key1).unwrap(), Some(content1.clone()));
+
+        log.insert(key2, content2.clone()).unwrap();
+        assert_eq!(log.get(key2).unwrap(), Some(content2.clone()));
+
+        // Now drop the DB and re-open to verify that re-loading works.
+        std::mem::drop(log);
+
+        let log2 = LogFs::<Journal2>::open(config.clone()).unwrap();
+
+        assert_eq!(log2.get(key1).unwrap(), Some(content1.clone()));
+        assert_eq!(log2.get(key2).unwrap(), Some(content2.clone()));
+
+        log2.remove(key1).unwrap();
+
+        log2.insert(key3_a, content3.clone()).unwrap();
+        assert_eq!(&log2.get(key3_a).unwrap().unwrap(), &content3);
+        log2.rename(key3_a, key3_b).unwrap();
+        assert_eq!(log2.get(key3_a).unwrap(), None);
+        assert_eq!(&log2.get(key3_b).unwrap().unwrap(), &content3);
+
+        std::mem::drop(log2);
+
+        let log3 = LogFs::<Journal2>::open(config.clone()).unwrap();
+        assert_eq!(log3.get(key1).unwrap(), None);
+        assert_eq!(log3.get(key2).unwrap(), Some(content2.clone()));
+
+        assert_eq!(log3.get(key3_a).unwrap(), None);
+        assert_eq!(&log3.get(key3_b).unwrap().unwrap(), &content3);
+
+        std::mem::drop(log3);
+
+        // Now verify that the header content is still there.
+
+        let mut f = std::fs::File::open(&config.path).unwrap();
+        let mut buf = vec![0u8; header_content.len()];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(header_content, &buf)
     }
 
     #[test]
@@ -534,7 +613,8 @@ mod tests {
 
     #[test]
     fn test_writer() -> Result<(), LogFsError> {
-        let config = test_config("writer");
+        let mut config = test_config("writer");
+
         let db = LogFs::<Journal2>::open(config.clone())?;
 
         let path1 = "regular";

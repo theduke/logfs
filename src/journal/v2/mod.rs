@@ -240,27 +240,63 @@ impl Journal2 {
         let is_new = !path.exists();
 
         // TODO: use file locks on platforms that support it.
-        let file = std::fs::OpenOptions::new()
+        let mut file = std::fs::OpenOptions::new()
             .create(config.allow_create)
             .read(true)
             .write(true)
             .open(&path)?;
+
+        let meta = file.metadata()?;
+
+        if let Some(offset) = config.offset {
+            if is_new {
+                return Err(LogFsError::new_internal(
+                    "config specified byte offset, but the specified file does not exist",
+                ));
+            }
+            if (meta.len() as u64) < offset {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::{linux::fs::MetadataExt, unix::fs::FileTypeExt};
+                    if meta.file_type().is_block_device() {
+                        // allow
+                    } else {
+                        return Err(LogFsError::new_internal(
+                            "config specified byte offset, but the specified file is smaller  then the offset",
+                        ));
+                    }
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                return Err(LogFsError::new_internal(
+                    "config specified byte offset, but the specified file is smaller  then the offset",
+                ));
+            }
+
+            file.seek(std::io::SeekFrom::Start(offset))?;
+        }
+
+        let base_offset = config.offset.unwrap_or_default();
+        let file_len = file.metadata()?.len();
 
         let tainted = write::TaintedFlag::new();
 
         tracing::trace!(?path, "opening logfs");
 
         let writer = if config.raw_mode {
-            match Self::open_existing(file, state, &crypto, &tainted) {
+            match Self::open_existing(file, state, &crypto, base_offset, &tainted) {
                 Ok(w) => w,
                 Err(_err) => {
                     if config.allow_create {
-                        let file = std::fs::OpenOptions::new()
+                        let mut file = std::fs::OpenOptions::new()
                             .create(true)
                             .read(true)
                             .write(true)
                             .open(&path)?;
-                        LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
+
+                        file.seek(SeekFrom::Start(base_offset))?;
+
+                        LogWriter::create_new(crypto.clone(), tainted.clone(), file, base_offset)?
                     } else {
                         return Err(LogFsError::new_internal(
                             "Could not open database: file does not appear to be a log",
@@ -268,10 +304,15 @@ impl Journal2 {
                     }
                 }
             }
-        } else if is_new {
+        } else if is_new || file_len == base_offset {
             if config.allow_create {
                 tracing::trace!(?path, "creating new log");
-                LogWriter::create_new(crypto.clone(), tainted.clone(), file)?
+                LogWriter::create_new(
+                    crypto.clone(),
+                    tainted.clone(),
+                    file,
+                    config.offset.unwrap_or_default(),
+                )?
             } else {
                 return Err(LogFsError::new_internal(format!(
                     "No log found at {}",
@@ -280,7 +321,7 @@ impl Journal2 {
             }
         } else {
             tracing::trace!(?path, "opening existing log");
-            Self::open_existing(file, state, &crypto, &tainted)?
+            Self::open_existing(file, state, &crypto, base_offset, &tainted)?
         };
 
         let j = Self {
@@ -298,15 +339,19 @@ impl Journal2 {
     }
 
     fn open_existing(
-        file: std::fs::File,
+        mut file: std::fs::File,
         state: &mut crate::state::State,
         crypto: &Option<Arc<Crypto>>,
+        base_offset: u64,
         tainted: &write::TaintedFlag,
     ) -> Result<LogWriter, LogFsError> {
         let meta = file.metadata()?;
         let file_size = meta.len();
 
-        let mut reader = read::LogReader::new_start(file, crypto.as_ref().map(|x| &**x));
+        debug_assert_eq!(file.stream_position().unwrap(), base_offset);
+
+        let mut reader =
+            read::LogReader::new_start(file, base_offset, crypto.as_ref().map(|x| &**x));
         let superblock = reader.read_superblocks()?;
 
         loop {
@@ -326,7 +371,13 @@ impl Journal2 {
                 "File was modified during bootstrap",
             ));
         }
-        let writer = LogWriter::open(crypto.clone(), tainted.clone(), file, superblock)?;
+        let writer = LogWriter::open(
+            crypto.clone(),
+            tainted.clone(),
+            file,
+            base_offset,
+            superblock,
+        )?;
         Ok(writer)
     }
 

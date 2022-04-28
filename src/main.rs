@@ -65,6 +65,10 @@ struct Options {
     /// Enables raw mode, which allows using raw block devices without a filesystem.
     #[structopt(long)]
     raw: bool,
+    /// Byte offset in the target  file. DB starts at the given offset.
+    #[structopt(long)]
+    offset: Option<u64>,
+
     #[structopt(short, long)]
     key: Option<String>,
     #[structopt(long)]
@@ -82,6 +86,7 @@ struct Options {
 impl Options {
     fn build_config(&self) -> logfs::LogConfig {
         logfs::LogConfig {
+            offset: self.offset,
             path: self.path.clone().into(),
             raw_mode: self.raw,
             allow_create: self.create,
