@@ -257,7 +257,7 @@ impl Journal2 {
             if (meta.len() as u64) < offset {
                 #[cfg(target_os = "linux")]
                 {
-                    use std::os::{linux::fs::MetadataExt, unix::fs::FileTypeExt};
+                    use std::os::unix::fs::FileTypeExt;
                     if meta.file_type().is_block_device() {
                         // allow
                     } else {
