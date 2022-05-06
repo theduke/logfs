@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_writer() -> Result<(), LogFsError> {
-        let mut config = test_config("writer");
+        let config = test_config("writer");
 
         let db = LogFs::<Journal2>::open(config.clone())?;
 
