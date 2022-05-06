@@ -129,7 +129,9 @@ pub struct KeyIndex {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub enum CompressionFormat {}
+pub enum CompressionFormat {
+    Brotli,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct ActionIndexWrite {

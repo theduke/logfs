@@ -3,8 +3,9 @@ mod repair;
 pub mod write;
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
-    io::{self, Seek, SeekFrom},
+    io::{self, Cursor, Seek, SeekFrom},
     sync::{Arc, Mutex},
 };
 
@@ -253,9 +254,18 @@ fn restore_index<R: io::Read + io::Seek>(
         let (entry, data) = reader.next_entry(Some(&mut buffer))?;
         match entry.entry.action {
             data::JournalAction::IndexWrite(header) => {
-                if let Some(_compression) = header.compression {
-                    todo!("implement decompression");
-                }
+                let data = if let Some(compression) = header.compression {
+                    match compression {
+                        data::CompressionFormat::Brotli => {
+                            let mut data: &[u8] = data;
+                            let mut buffer = Cursor::new(Vec::<u8>::new());
+                            brotli::BrotliDecompress(&mut data, &mut buffer)?;
+                            Cow::Owned(buffer.into_inner())
+                        }
+                    }
+                } else {
+                    Cow::Borrowed(data)
+                };
 
                 let data: data::KeyIndex = bincode::deserialize(&data)?;
                 prev_pointer = data.parent_entry;
@@ -530,6 +540,18 @@ impl Journal2 {
                 .collect(),
         };
         let data = bincode::serialize(&index)?;
+        // Compress.
+        let (data, compression) = {
+            let mut buffer = Cursor::new(Vec::<u8>::new());
+            let mut input = data.as_slice();
+            brotli::BrotliCompress(
+                &mut input,
+                &mut buffer,
+                &brotli::enc::BrotliEncoderInitParams(),
+            )?;
+
+            (buffer.into_inner(), data::CompressionFormat::Brotli)
+        };
 
         // TODO: compression
 
@@ -538,7 +560,7 @@ impl Journal2 {
         let action = data::JournalAction::IndexWrite(data::ActionIndexWrite {
             size: data.len() as u64,
             hash,
-            compression: None,
+            compression: Some(compression),
         });
 
         let chunk_size = data.len();
