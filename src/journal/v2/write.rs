@@ -8,11 +8,11 @@ use sha2::Digest;
 use crate::{
     crypto::Crypto,
     journal::{
-        v2::{ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK},
+        v2::{data::EntryPointer, ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK},
         SequenceId,
     },
     state::KeyPointer,
-    LogFsError,
+    KeyLock, LogFsError,
 };
 
 use super::{
@@ -53,11 +53,38 @@ pub(crate) struct LogWriter {
     // TODO: implement index recording!
     #[allow(dead_code)]
     actions_since_last_index_write: u64,
+
+    last_written_index: Option<data::EntryPointer>,
+}
+
+impl std::fmt::Debug for LogWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogWriter")
+            .field("base_offset", &self.base_offset)
+            .field("next_sequence", &self.next_sequence)
+            .field("offset", &self.offset)
+            .field("writer", &self.writer)
+            .field("active_superblock", &self.active_superblock)
+            .field(
+                "incomplete_entry_in_progress",
+                &self.incomplete_entry_in_progress,
+            )
+            .field(
+                "actions_since_last_index_write",
+                &self.actions_since_last_index_write,
+            )
+            .field("last_written_index", &self.last_written_index)
+            .finish()
+    }
 }
 
 impl LogWriter {
     pub(crate) fn offset(&self) -> data::Offset {
         self.offset
+    }
+
+    pub(super) fn active_superblock(&self) -> &IndexedSuperBlock {
+        &self.active_superblock
     }
 
     pub(crate) fn create_new(
@@ -85,6 +112,7 @@ impl LogWriter {
             },
             actions_since_last_index_write: 0,
             tainted,
+            last_written_index: None,
         };
 
         s.create_superblocks()?;
@@ -121,6 +149,7 @@ impl LogWriter {
                 .unwrap_or(block.block.active_sequence),
             active_superblock: block,
             tainted,
+            last_written_index: None,
         };
 
         Ok(s)
@@ -163,7 +192,10 @@ impl LogWriter {
                 flags: self.active_superblock.block.flags,
                 active_sequence: self.next_sequence.as_u64() - 1,
                 tail_offset: self.offset - self.base_offset,
-                last_index_entry: self.active_superblock.block.last_index_entry.clone(),
+                last_index_entry: self
+                    .last_written_index
+                    .clone()
+                    .or_else(|| self.active_superblock.block.last_index_entry.clone()),
             },
         };
         self.apply_superblock(block)
@@ -260,6 +292,13 @@ impl LogWriter {
         debug_assert_eq!(self.offset, self.writer.stream_position().unwrap());
 
         if !incomplete {
+            if action.is_index_write() {
+                self.last_written_index = Some(EntryPointer {
+                    sequence,
+                    offset: header.offset,
+                });
+            }
+
             self.write_next_superblock()?;
         }
 
@@ -492,16 +531,18 @@ pub struct KeyWriter {
     writer: Option<LogChunkWriter>,
     buffer: Vec<u8>,
     buffer_offset: usize,
+    _lock: Option<KeyLock>,
 }
 
 impl KeyWriter {
-    pub fn new(writer: LogChunkWriter) -> Self {
+    pub fn new(writer: LogChunkWriter, lock: Option<KeyLock>) -> Self {
         let mut buffer = Vec::new();
         buffer.resize(writer.chunk_size as usize, 0);
         Self {
             buffer,
             writer: Some(writer),
             buffer_offset: 0,
+            _lock: lock,
         }
     }
 

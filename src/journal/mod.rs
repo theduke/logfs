@@ -1,12 +1,12 @@
 pub mod v2;
-pub use v2::Journal2;
+pub use v2::{Journal2, Superblock};
 
-use std::{num::NonZeroU64, path::PathBuf, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf, sync::Arc};
 
 use crate::{
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
-    LogConfig, LogFsError,
+    KeyLock, LogConfig, LogFsError,
 };
 
 use self::v2::{
@@ -48,6 +48,19 @@ impl SequenceId {
             })
     }
 
+    pub fn try_decrement(self) -> Result<Self, LogFsError> {
+        self.0
+            .get()
+            .checked_sub(1)
+            .map(|x| Self(NonZeroU64::new(x).unwrap()))
+            .ok_or_else(|| {
+                // TODO: use special error variant.
+                LogFsError::new_internal(
+                    "Number of log entries exceeds the maximum. Rewrite the log to fix this.",
+                )
+            })
+    }
+
     pub fn as_u64(self) -> u64 {
         self.0.get()
     }
@@ -64,7 +77,7 @@ pub struct RepairConfig {
 pub trait JournalStore {
     fn open(
         path: std::path::PathBuf,
-        state: &mut crate::state::State,
+        tree: SharedTree,
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError>
@@ -81,11 +94,22 @@ pub trait JournalStore {
 
     fn write_insert(&self, path: Path, data: Vec<u8>) -> Result<KeyPointer, LogFsError>;
 
-    fn insert_writer(&self, path: Path, tree: SharedTree) -> Result<KeyWriter, LogFsError>;
+    fn insert_writer(
+        &self,
+        path: Path,
+        tree: SharedTree,
+        writer_lock: KeyLock,
+    ) -> Result<KeyWriter, LogFsError>;
 
     fn write_rename(&self, old_path: Path, new_path: Path) -> Result<(), LogFsError>;
 
     fn write_remove(&self, paths: Vec<Path>) -> Result<(), LogFsError>;
+
+    fn write_index(
+        &self,
+        tree: &BTreeMap<String, KeyPointer>,
+        full: bool,
+    ) -> Result<(), LogFsError>;
 
     fn read_data(&self, pointer: &KeyPointer) -> Result<Vec<u8>, LogFsError>;
 
@@ -94,4 +118,5 @@ pub trait JournalStore {
     fn read_chunks(&self, pointer: &KeyPointer) -> Result<KeyChunkIter, LogFsError>;
 
     fn size_log(&self) -> Result<u64, LogFsError>;
+    fn supberlock(&self) -> Result<Superblock, LogFsError>;
 }

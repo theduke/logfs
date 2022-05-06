@@ -1,6 +1,6 @@
 //! Types representing the data written to the log.
 
-use crate::{crypto::Crypto, journal::SequenceId};
+use crate::{crypto::Crypto, journal::SequenceId, DataOffset};
 
 // /// A magic marker used to
 // #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone, Debug)]
@@ -105,8 +105,11 @@ pub struct ActionKeyDelete {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct KeyIndexEntry {
-    pub entry: JournalEntryHeader,
-    pub key: KeyMeta,
+    pub key: KeyPath,
+    pub sequence_id: SequenceId,
+    pub file_offset: DataOffset,
+    pub size: ByteCountU64,
+    pub chunk_size: Option<ByteCountU32>,
 }
 
 /// An index that contains all keys and associated metadata.
@@ -114,12 +117,28 @@ pub struct KeyIndexEntry {
 /// An index can be written to the log to speed up re-opening.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct KeyIndex {
+    /// Pointer to a previous index location.
+    /// If present, this index is only partial and does not contain a full
+    /// snapshot. To build a full index, the parent must be read first.
+    /// This index will contain all updates since the previous one.
+    pub parent_entry: Option<EntryPointer>,
+
+    /// The available keys. If [`Self::parent_entry`] is [`None`], this is a
+    /// full snapshot, otherwise it's a partial snapshot since the last entry.
     pub keys: Vec<KeyIndexEntry>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum CompressionFormat {}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct ActionIndexWrite {
+    /// Serialized index length.
     pub size: ByteCountU64,
+    /// Hash of the serialized index.
+    pub hash: Sha256Hash,
+    /// Optional compression method.
+    pub compression: Option<CompressionFormat>,
 }
 
 /// A file action in the log/journal.
@@ -148,9 +167,17 @@ impl JournalAction {
             Self::KeyDelete(_) => 0,
             Self::IndexWrite(w) => {
                 let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as u64;
-                w.size as u64 + padding
+                w.size + padding
             }
         }
+    }
+
+    /// Returns `true` if the journal action is [`IndexWrite`].
+    ///
+    /// [`IndexWrite`]: JournalAction::IndexWrite
+    #[must_use]
+    pub fn is_index_write(&self) -> bool {
+        matches!(self, Self::IndexWrite(..))
     }
 }
 
@@ -202,7 +229,7 @@ pub struct JournalEntry {
 /// A "pointer" to a log entry.
 ///
 /// Contains the information required for reading the entry.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct EntryPointer {
     pub sequence: SequenceId,
     pub offset: Offset,
@@ -226,7 +253,7 @@ pub enum LogFormatVersion {
 ///
 /// Superblocks are written to the header of a log file to enable both
 /// consistency validations and quicker re-opening.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Superblock {
     pub format_version: LogFormatVersion,
     pub flags: SuperblockFlags,

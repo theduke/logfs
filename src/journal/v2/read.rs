@@ -1,12 +1,13 @@
 use std::{
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{self, BufReader, Read, Seek, SeekFrom},
     sync::Arc,
 };
 
 use crate::{crypto::Crypto, journal::SequenceId, state::KeyPointer, LogFsError};
 
 use super::{
-    data, IndexedSuperBlock, PersistedEntry, ENTRY_ACTION_CHUNK, ENTRY_FIRST_DATA_CHUNK,
+    data::{self, EntryPointer},
+    IndexedSuperBlock, PersistedEntry, ENTRY_ACTION_CHUNK, ENTRY_FIRST_DATA_CHUNK,
     ENTRY_HEADER_CHUNK,
 };
 
@@ -84,6 +85,33 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         Ok(block)
     }
 
+    pub(super) fn rewind_to_first_entry(&mut self) -> Result<(), LogFsError> {
+        let target = self.base_offset + data::Superblock::HEADER_SIZE;
+        self.reader.seek(io::SeekFrom::Start(target))?;
+        self.offset = target;
+        Ok(())
+    }
+
+    pub(super) fn seek_to_pointer(&mut self, entry: EntryPointer) -> Result<(), LogFsError> {
+        let start = self.offset;
+        debug_assert_eq!(start, self.reader.stream_position()? + self.base_offset);
+
+        let offset = self.base_offset + entry.offset;
+        match self.reader.seek(SeekFrom::Start(offset)) {
+            Ok(_) => {
+                self.offset = offset;
+                self.next_sequence = entry.sequence;
+                Ok(())
+            }
+            Err(err) => {
+                self.reader
+                    .seek(SeekFrom::Start(start))
+                    .expect("Could not restore reader to origina position after seek error");
+                Err(err.into())
+            }
+        }
+    }
+
     /* fn skip_superblocks(&mut self) -> Result<(), LogFsError> {
         self.reader.seek_relative(
             data::Superblock::HEADER_COUNT as i64 * data::Superblock::SERIALIZED_LEN as i64,
@@ -91,7 +119,14 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         Ok(())
     } */
 
-    pub(super) fn next_entry(&mut self) -> Result<PersistedEntry, LogFsError> {
+    /// Read the next journal entry.
+    ///
+    /// If data_buffer is provided, the entry data will be written to the buffer
+    /// in its entirety. Otherwise the data is skipped.
+    pub(super) fn next_entry<'b>(
+        &mut self,
+        data_buffer: Option<&'b mut Vec<u8>>,
+    ) -> Result<(PersistedEntry, &'b [u8]), LogFsError> {
         let chunk_padding = self.crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as usize;
         let start_offset = self.offset;
         let buffer = &mut self.buffer;
@@ -145,19 +180,36 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
 
         let action: data::JournalAction = bincode::deserialize(action_data)?;
         let data_len = action.payload_len(self.crypto.clone());
-        self.reader.seek(SeekFrom::Current(data_len as i64))?;
 
         let data_offset = start_offset + header_size as u64 + action_size as u64;
         let next_entry_offset = data_offset + data_len;
+
+        let decrypted_data: &'b [u8] = if let Some(buffer_ref) = data_buffer {
+            debug_assert_eq!(data_offset, self.reader.stream_position().unwrap());
+
+            buffer_ref.resize(data_len as usize, 0);
+            self.reader.read_exact(buffer_ref)?;
+
+            if let Some(crypto) = &self.crypto {
+                crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_FIRST_DATA_CHUNK, buffer_ref)?
+            } else {
+                buffer_ref.as_slice()
+            }
+        } else {
+            self.reader.seek(SeekFrom::Current(data_len as i64))?;
+            &[]
+        };
+
         self.offset = next_entry_offset;
         self.next_sequence = self.next_sequence.try_increment()?;
 
         assert_eq!(self.offset, self.reader.stream_position()?);
 
-        Ok(PersistedEntry {
+        let entry = PersistedEntry {
             entry: data::JournalEntry { header, action },
             file_data_offset: data_offset,
-        })
+        };
+        Ok((entry, decrypted_data))
     }
 }
 

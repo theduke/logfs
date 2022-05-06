@@ -1,6 +1,6 @@
 use std::{
     io::{BufReader, Read, Seek, SeekFrom},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use crate::{
@@ -138,12 +138,12 @@ pub fn repair(
         }
     };
 
-    let mut new_state = crate::state::State::new();
+    let new_state = Arc::new(RwLock::new(crate::state::State::new()));
     let new_config = LogConfig {
         allow_create: true,
         ..log_config.clone()
     };
-    let j = Journal2::open(target_path, &mut new_state, crypto.clone(), &new_config)?;
+    let j = Journal2::open(target_path, new_state.clone(), crypto.clone(), &new_config)?;
 
     let mut file = reader.into_inner();
     for (key, pointer) in state.tree {

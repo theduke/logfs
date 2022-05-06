@@ -3,7 +3,8 @@ mod repair;
 pub mod write;
 
 use std::{
-    io::{Seek, SeekFrom},
+    collections::BTreeMap,
+    io::{self, Seek, SeekFrom},
     sync::{Arc, Mutex},
 };
 
@@ -12,20 +13,40 @@ use sha2::Digest;
 use crate::{
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
-    LogConfig, LogFsError,
+    KeyLock, LogConfig, LogFsError, Path,
 };
 
-use self::{data::Offset, write::LogWriter};
+use self::{
+    data::{EntryPointer, Offset},
+    write::LogWriter,
+};
 
 use super::{RepairConfig, SequenceId};
 
 mod data;
+pub use data::Superblock;
 
 #[derive(Debug)]
 struct PersistedEntry {
     entry: data::JournalEntry,
     /// The offset where the entry data starts.
     file_data_offset: data::Offset,
+}
+
+impl PersistedEntry {
+    // fn to_key_pointer(&self, crypto: Option<&Crypto>) -> KeyPointer {
+    //     KeyPointer {
+    //         sequence_id: self.entry.header.sequence_id.as_u64(),
+    //         file_offset: self.file_data_offset,
+    //         size: self.entry.action.payload_len(crypto),
+    //         chunk_size: match &self.entry.action {
+    //             data::JournalAction::KeyInsert(ins) => ins.meta.chunk_size,
+    //             data::JournalAction::KeyRename(_) => None,
+    //             data::JournalAction::KeyDelete(_) => None,
+    //             data::JournalAction::IndexWrite(_) => None,
+    //         },
+    //     }
+    // }
 }
 
 pub struct Journal2 {
@@ -36,6 +57,7 @@ pub struct Journal2 {
     default_chunk_size: u32,
 }
 
+#[derive(Debug)]
 enum WriterState {
     // FIXME: clean up log writer tainting logic
     #[allow(dead_code)]
@@ -57,37 +79,27 @@ impl State {
     fn return_writer(&self, writer: LogWriter) {
         *self.writer.lock().unwrap() = WriterState::Available(Some(writer));
         self.writer_condvar.notify_one();
+        eprintln!("borrowed writer returned");
     }
 
     fn acquire_borrowed_writer(&self) -> Result<LogWriter, LogFsError> {
-        loop {
-            let mut lock = self
-                .writer
-                .lock()
-                .map_err(|_| LogFsError::new_internal("Could not acquire writer"))?;
+        let mut lock = self
+            .writer
+            .lock()
+            .map_err(|_| LogFsError::new_internal("Could not acquire writer"))?;
 
+        loop {
             match &mut *lock {
                 WriterState::Available(w) => match w.take() {
                     Some(w) => {
+                        eprintln!("borrowed writer acquired");
                         return Ok(w);
                     }
                     None => {
-                        let mut new_lock = self
+                        lock = self
                             .writer_condvar
                             .wait(lock)
                             .map_err(|_| LogFsError::Tainted)?;
-                        match &mut *new_lock {
-                            WriterState::Closed => {
-                                return Err(LogFsError::WriterClosed);
-                            }
-                            WriterState::Available(writer_opt) => {
-                                if let Some(w) = writer_opt.take() {
-                                    return Ok(w);
-                                } else {
-                                    continue;
-                                }
-                            }
-                        }
                     }
                 },
                 WriterState::Closed => {
@@ -161,7 +173,7 @@ fn determine_file_size(f: &mut std::fs::File) -> Result<u64, LogFsError> {
 }
 
 fn read_entry_header(
-    reader: &mut impl std::io::Read,
+    reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
     crypto: Option<&Crypto>,
     sequence: SequenceId,
@@ -185,7 +197,7 @@ fn read_entry_header(
 }
 
 fn read_entry_action(
-    reader: &mut impl std::io::Read,
+    reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
     crypto: Option<&Crypto>,
     header: &data::JournalEntryHeader,
@@ -209,7 +221,7 @@ fn read_entry_action(
 }
 
 fn read_entry(
-    reader: &mut impl std::io::Read,
+    reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
     crypto: Option<&Crypto>,
     sequence: SequenceId,
@@ -220,10 +232,62 @@ fn read_entry(
     Ok(data::JournalEntry { header, action })
 }
 
+fn restore_index<R: io::Read + io::Seek>(
+    reader: &mut read::LogReader<R>,
+    pointer: EntryPointer,
+) -> Result<BTreeMap<Path, KeyPointer>, LogFsError> {
+    let mut tree = BTreeMap::<Path, KeyPointer>::new();
+
+    tracing::trace!(
+        sequence=%pointer.sequence.as_u64(),
+        offset=%pointer.offset,
+        "restoring index"
+    );
+
+    let mut prev_pointer = Some(pointer);
+    let mut buffer = Vec::new();
+
+    while let Some(pointer) = prev_pointer {
+        reader.seek_to_pointer(pointer)?;
+
+        let (entry, data) = reader.next_entry(Some(&mut buffer))?;
+        match entry.entry.action {
+            data::JournalAction::IndexWrite(header) => {
+                if let Some(_compression) = header.compression {
+                    todo!("implement decompression");
+                }
+
+                let data: data::KeyIndex = bincode::deserialize(&data)?;
+                prev_pointer = data.parent_entry;
+
+                for item in data.keys {
+                    // Note: ignore already existing keys, since they would
+                    // already contain newer data from a previous entry.
+                    tree.entry(item.key).or_insert_with(|| KeyPointer {
+                        sequence_id: item.sequence_id.as_u64(),
+                        file_offset: item.file_offset,
+                        size: item.size,
+                        chunk_size: item.chunk_size,
+                    });
+                }
+            }
+            _ => {
+                return Err(LogFsError::new_internal(
+                    "Invalid index pointer: log entry is not an index",
+                ))?;
+            }
+        }
+    }
+
+    tracing::debug!(key_count=%tree.len(), "index restored");
+
+    Ok(tree)
+}
+
 impl Journal2 {
     pub fn open(
         path: std::path::PathBuf,
-        state: &mut crate::state::State,
+        tree: SharedTree,
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError> {
@@ -273,7 +337,7 @@ impl Journal2 {
                 ));
             }
 
-            file.seek(std::io::SeekFrom::Start(offset))?;
+            file.seek(io::SeekFrom::Start(offset))?;
         }
 
         let base_offset = config.offset.unwrap_or_default();
@@ -284,7 +348,9 @@ impl Journal2 {
         tracing::trace!(?path, "opening logfs");
 
         let writer = if config.raw_mode {
-            match Self::open_existing(file, state, &crypto, base_offset, &tainted) {
+            let mut state = tree.write().unwrap();
+
+            match Self::open_existing(file, &mut state, &crypto, base_offset, &tainted) {
                 Ok(w) => w,
                 Err(_err) => {
                     if config.allow_create {
@@ -321,7 +387,8 @@ impl Journal2 {
             }
         } else {
             tracing::trace!(?path, "opening existing log");
-            Self::open_existing(file, state, &crypto, base_offset, &tainted)?
+            let mut state = tree.write().unwrap();
+            Self::open_existing(file, &mut state, &crypto, base_offset, &tainted)?
         };
 
         let j = Self {
@@ -354,12 +421,28 @@ impl Journal2 {
             read::LogReader::new_start(file, base_offset, crypto.as_ref().map(|x| &**x));
         let superblock = reader.read_superblocks()?;
 
-        loop {
-            // TODO: use sequence number instead to support raw files
-            if reader.next_sequence.as_u64() > superblock.block.active_sequence {
-                break;
+        // If an index entry is present, use it to restore the index.
+        if let Some(index_pointer) = superblock.block.last_index_entry {
+            match restore_index(&mut reader, index_pointer) {
+                Ok(tree) => {
+                    state.set_tree(tree);
+                }
+                Err(error) => {
+                    #[cfg(test)]
+                    panic!("could not restore index: {error:?}");
+
+                    #[cfg(not(test))]
+                    {
+                        tracing::warn!(?error, "could not restore index - attempting full scan");
+
+                        reader.rewind_to_first_entry()?;
+                    }
+                }
             }
-            let entry = reader.next_entry()?;
+        };
+
+        while reader.next_sequence.as_u64() <= superblock.block.active_sequence {
+            let (entry, _) = reader.next_entry(None)?;
             apply_entry(state, entry)?;
         }
 
@@ -400,37 +483,69 @@ impl Journal2 {
         data: Option<Vec<u8>>,
         chunk_size: u32,
     ) -> Result<PersistedEntry, LogFsError> {
-        loop {
-            let mut writer = self
-                .state
-                .writer
-                .lock()
-                .map_err(|_| LogFsError::new_internal("Could not retrieve log writer"))?;
-            match &mut *writer {
-                WriterState::Closed => return Err(LogFsError::new_internal("Log is closed")),
+        let mut guard = self.state.writer.lock().unwrap();
+
+        let res = loop {
+            match &mut *guard {
+                WriterState::Closed => break Err(LogFsError::new_internal("Log is closed")),
+                WriterState::Available(Some(w)) => {
+                    let entry = w.write_journal_entry(chunk_size, action, data, false)?;
+
+                    break Ok(entry);
+                }
                 WriterState::Available(None) => {
-                    let mut new_state = self
+                    guard = self
                         .state
                         .writer_condvar
-                        .wait(writer)
+                        .wait(guard)
                         .map_err(|_| LogFsError::Tainted)?;
-                    match &mut *new_state {
-                        WriterState::Available(Some(w)) => {
-                            return w.write_journal_entry(chunk_size, action, data, false);
-                        }
-                        WriterState::Available(None) => {
-                            continue;
-                        }
-                        WriterState::Closed => {
-                            return Err(LogFsError::WriterClosed);
-                        }
-                    }
-                }
-                WriterState::Available(Some(w)) => {
-                    return w.write_journal_entry(chunk_size, action, data, false);
+                    continue;
                 }
             }
-        }
+        };
+
+        self.state.writer_condvar.notify_one();
+
+        res
+    }
+
+    fn write_index(
+        &self,
+        tree: &BTreeMap<String, KeyPointer>,
+        _full: bool,
+    ) -> Result<(), LogFsError> {
+        // TODO: implement partial writes.
+
+        let index = data::KeyIndex {
+            parent_entry: None,
+            keys: tree
+                .iter()
+                .map(|(key, ptr)| data::KeyIndexEntry {
+                    key: key.clone(),
+                    sequence_id: SequenceId::from_u64(ptr.sequence_id),
+                    file_offset: ptr.file_offset,
+                    size: ptr.size,
+                    chunk_size: ptr.chunk_size,
+                })
+                .collect(),
+        };
+        let data = bincode::serialize(&index)?;
+
+        // TODO: compression
+
+        let hash = data::Sha256Hash(sha2::Sha256::digest(&data).into());
+
+        let action = data::JournalAction::IndexWrite(data::ActionIndexWrite {
+            size: data.len() as u64,
+            hash,
+            compression: None,
+        });
+
+        let chunk_size = data.len();
+
+        self.write_entry(action, Some(data), chunk_size as u32)?;
+
+        Ok(())
     }
 
     pub fn write_insert(
@@ -561,14 +676,14 @@ struct IndexedSuperBlock {
 impl super::JournalStore for Journal2 {
     fn open(
         path: std::path::PathBuf,
-        state: &mut crate::state::State,
+        tree: SharedTree,
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError>
     where
         Self: Sized,
     {
-        Journal2::open(path, state, crypto, config)
+        Journal2::open(path, tree, crypto, config)
     }
 
     fn repair(
@@ -590,15 +705,17 @@ impl super::JournalStore for Journal2 {
         &self,
         path: crate::Path,
         tree: SharedTree,
+        writer_lock: KeyLock,
     ) -> Result<write::KeyWriter, LogFsError> {
         let writer = self.state.acquire_borrowed_writer()?;
-        Ok(write::KeyWriter::new(write::LogChunkWriter::new(
+        let chunk = write::LogChunkWriter::new(
             tree,
             self.state.clone(),
             writer,
             self.default_chunk_size,
             path,
-        )?))
+        )?;
+        Ok(write::KeyWriter::new(chunk, Some(writer_lock)))
     }
 
     fn write_rename(&self, old_path: crate::Path, new_path: crate::Path) -> Result<(), LogFsError> {
@@ -633,5 +750,18 @@ impl super::JournalStore for Journal2 {
             }
             WriterState::Available(Some(w)) => Ok(w.offset()),
         }
+    }
+
+    fn supberlock(&self) -> Result<Superblock, LogFsError> {
+        let writer = self.state.acquire_borrowed_writer()?;
+        Ok(writer.active_superblock().block.clone())
+    }
+
+    fn write_index(
+        &self,
+        tree: &BTreeMap<String, KeyPointer>,
+        full: bool,
+    ) -> Result<(), LogFsError> {
+        self.write_index(tree, full)
     }
 }

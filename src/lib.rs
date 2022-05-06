@@ -5,7 +5,7 @@ mod journal;
 mod state;
 use journal::{
     v2::read::{KeyChunkIter, StdKeyReader},
-    SequenceId,
+    SequenceId, Superblock,
 };
 pub use journal::{Journal2, JournalStore};
 
@@ -14,7 +14,7 @@ pub use crypto::CryptoConfig;
 
 use std::{
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Condvar, Mutex, RwLock},
 };
 
 type Path = String;
@@ -35,6 +35,9 @@ impl ConfigBuilder {
                 raw_mode: false,
                 crypto: None,
                 default_chunk_size: DEFAULT_CHUNK_SIZE,
+                // TODO: determine good defaults for these values!
+                partial_index_write_interval: 100,
+                full_index_write_interval: 1000,
             },
         }
     }
@@ -44,8 +47,13 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn offset(mut self, offset: u64) -> Self {
-        self.config.offset = Some(offset);
+    pub fn offset(mut self, offset: Option<u64>) -> Self {
+        self.config.offset = offset;
+        self
+    }
+
+    pub fn default_chunk_size(mut self, size: u32) -> Self {
+        self.config.default_chunk_size = size;
         self
     }
 
@@ -82,6 +90,13 @@ pub struct LogConfig {
     ///
     /// Note that keys can also be created with a custom chunk size.
     pub default_chunk_size: u32,
+
+    /// Determines after how many journal entries a new partial index snapshot
+    /// is written.
+    pub partial_index_write_interval: u64,
+    /// Determines after how many journal entries a new full index snapshot is
+    /// written.
+    pub full_index_write_interval: u64,
 }
 
 pub struct RepairConfig {
@@ -107,14 +122,31 @@ impl Clone for LogFs {
 }
 
 struct Inner<J> {
+    config: LogConfig,
     state: Arc<RwLock<state::State>>,
+    locks: Arc<Locks>,
     journal: J,
+}
+
+struct Locks {
+    key_lock: Mutex<bool>,
+    key_lock_condvar: Condvar,
 }
 
 #[derive(Clone, Debug)]
 pub struct KeyMeta {
     pub size: u64,
     pub chunk_size: Option<u32>,
+}
+
+pub struct KeyLock(Arc<Locks>);
+
+impl Drop for KeyLock {
+    fn drop(&mut self) {
+        let mut flag = self.0.key_lock.lock().unwrap();
+        *flag = false;
+        self.0.key_lock_condvar.notify_all();
+    }
 }
 
 type DataOffset = u64;
@@ -127,17 +159,26 @@ impl<J: JournalStore> LogFs<J> {
             .crypto
             .take()
             .map(|c| Arc::new(crypto::Crypto::new(c)));
-        let mut state = state::State::new();
+        let state = Arc::new(RwLock::new(state::State::new()));
         let path = config.path.clone();
-        let journal = J::open(path.clone(), &mut state, crypto.clone(), &config)?;
+        let journal = J::open(path.clone(), state.clone(), crypto.clone(), &config)?;
 
         Ok(Self {
             path,
             inner: Arc::new(Inner {
-                state: Arc::new(RwLock::new(state)),
+                state,
+                config,
                 journal,
+                locks: Arc::new(Locks {
+                    key_lock: Mutex::new(false),
+                    key_lock_condvar: Condvar::new(),
+                }),
             }),
         })
+    }
+
+    pub fn superblock(&self) -> Result<Superblock, LogFsError> {
+        self.inner.journal.supberlock()
     }
 
     pub fn repair(mut config: LogConfig, repair_config: RepairConfig) -> Result<(), LogFsError> {
@@ -166,7 +207,12 @@ impl<J: JournalStore> LogFs<J> {
 
     /// Returns the approximate amount of bytes that could be saved when
     /// re-writing the log.
-    pub fn redundant_data_estimate(&self) -> u128 {
+    ///
+    /// Returns [`None`] if no estimate is available.
+    /// This is the case if the log was restored from an index without a full
+    /// scan.
+    // TODO: if estimate is not available, do a full scan to determine estimate.
+    pub fn redundant_data_estimate(&self) -> Option<u128> {
         self.inner
             .state
             .read()
@@ -243,12 +289,41 @@ impl<J: JournalStore> LogFs<J> {
         Ok(self.inner.state.read().unwrap().paths_prefix(prefix))
     }
 
+    fn acquire_key_lock(&self) -> KeyLock {
+        let mut flag = self.inner.locks.key_lock.lock().unwrap();
+        while *flag {
+            flag = self.inner.locks.key_lock_condvar.wait(flag).unwrap();
+        }
+        *flag = true;
+        KeyLock(self.inner.locks.clone())
+    }
+
+    fn write_index_if_required(&self, state: &mut state::State) -> Result<(), LogFsError> {
+        // TODO: support partial index writes!
+
+        if state.write_counter > self.inner.config.full_index_write_interval {
+            self.inner.journal.write_index(&state.tree, true)?;
+            state.write_counter = 0;
+        }
+
+        Ok(())
+    }
+
     /// Insert a key.
     pub fn insert(&self, path: impl Into<String>, data: Vec<u8>) -> Result<(), LogFsError> {
         let path = path.into();
-        let mut state = self.inner.state.write().unwrap();
+        let _lock = self.acquire_key_lock();
+
+        eprintln!("writing journal");
         let pointer = self.inner.journal.write_insert(path.clone(), data)?;
+
+        eprintln!("updating state");
+        let mut state = self.inner.state.write().unwrap();
         state.add_key(path, pointer);
+        eprintln!("done");
+
+        self.write_index_if_required(&mut state)?;
+
         Ok(())
     }
 
@@ -256,9 +331,10 @@ impl<J: JournalStore> LogFs<J> {
         &self,
         path: impl Into<String>,
     ) -> Result<journal::v2::write::KeyWriter, LogFsError> {
+        let lock = self.acquire_key_lock();
         self.inner
             .journal
-            .insert_writer(path.into(), self.inner.state.clone())
+            .insert_writer(path.into(), self.inner.state.clone(), lock)
     }
 
     /// Rename a key.
@@ -269,10 +345,11 @@ impl<J: JournalStore> LogFs<J> {
     ) -> Result<(), LogFsError> {
         let old_key = old_key.into();
         let new_key = new_key.into();
-        let mut state = self.inner.state.write().unwrap();
+
+        let _lock = self.acquire_key_lock();
 
         // Ensure key exists.
-        if state.get_key(&old_key).is_none() {
+        if self.inner.state.read().unwrap().get_key(&old_key).is_none() {
             return Err(LogFsError::NotFound {
                 path: old_key.into(),
             });
@@ -282,8 +359,10 @@ impl<J: JournalStore> LogFs<J> {
             .journal
             .write_rename(old_key.clone(), new_key.clone())?;
 
+        let mut state = self.inner.state.write().unwrap();
         // NOTE: unwrap can't fail, since key existence was checked above.
         state.rename_key(&old_key, new_key).unwrap();
+        self.write_index_if_required(&mut state)?;
 
         Ok(())
     }
@@ -293,9 +372,12 @@ impl<J: JournalStore> LogFs<J> {
         let path = path.as_ref();
 
         let mut state = self.inner.state.write().unwrap();
-
         if let Some(_pointer) = state.remove_key(path) {
+            let _lock = self.acquire_key_lock();
+
             self.inner.journal.write_remove(vec![path.to_string()])?;
+
+            self.write_index_if_required(&mut state)?;
         }
 
         Ok(())
@@ -303,16 +385,21 @@ impl<J: JournalStore> LogFs<J> {
 
     /// Remove a whole key prefix.
     pub fn remove_prefix(&self, prefix: impl AsRef<str>) -> Result<(), LogFsError> {
-        let mut state = self.inner.state.write().unwrap();
+        let state = self.inner.state.write().unwrap();
         let paths = state.paths_prefix(prefix.as_ref());
 
         if !paths.is_empty() {
+            let _lock = self.acquire_key_lock();
+            std::mem::drop(state);
             self.inner.journal.write_remove(paths.clone())?;
         }
 
+        let mut state = self.inner.state.write().unwrap();
         for path in paths {
             state.remove_key(&path);
         }
+
+        self.write_index_if_required(&mut state)?;
 
         Ok(())
     }
@@ -365,6 +452,8 @@ mod tests {
             }),
             // Set a very low chunk size to test chunking.
             default_chunk_size: 3,
+            partial_index_write_interval: 5,
+            full_index_write_interval: 10,
         }
     }
 
@@ -715,5 +804,69 @@ mod tests {
         assert!(chunks.next().is_none());
 
         assert!(chunks.skip_bytes(6).is_err());
+    }
+
+    #[test]
+    fn test_minimal_index_writes() {
+        let mut config = test_config("test_minimal_index_writes");
+        config.partial_index_write_interval = 1;
+        config.full_index_write_interval = 1;
+
+        {
+            let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+            db.insert("a", b"a".to_vec()).unwrap();
+        }
+
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+        assert_eq!(db.get("a").unwrap().unwrap(), b"a");
+    }
+
+    #[test]
+    fn test_many_index_writes() {
+        let mut config = test_config("test_many_index_writes");
+        config.partial_index_write_interval = 1;
+        config.full_index_write_interval = 2;
+
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+
+        // Insert 100 keys.
+        for x in 0..100 {
+            eprintln!("writing key {x}");
+            db.insert(x.to_string(), x.to_string().into_bytes())
+                .unwrap();
+        }
+
+        // Rename a third of the keys.
+
+        for x in (0..100).skip(1).step_by(3) {
+            eprintln!("renaming key {x}");
+            db.rename(x.to_string(), format!("{x}_renamed")).unwrap();
+        }
+
+        // delete a third of the keys.
+        for x in (0..100).skip(2).step_by(3) {
+            eprintln!("deleting key {x}");
+            db.remove(x.to_string()).unwrap();
+        }
+
+        std::mem::drop(db);
+
+        let db = LogFs::<Journal2>::open(config).unwrap();
+
+        for x in 0..100 {
+            if x % 3 == 0 {
+                assert_eq!(
+                    db.get(x.to_string()).unwrap().unwrap(),
+                    x.to_string().into_bytes()
+                );
+            } else if x % 3 == 1 {
+                assert_eq!(
+                    db.get(format!("{x}_renamed")).unwrap().unwrap(),
+                    x.to_string().into_bytes()
+                );
+            } else {
+                assert_eq!(db.get(x.to_string()).unwrap(), None);
+            }
+        }
     }
 }

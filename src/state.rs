@@ -34,7 +34,9 @@ pub struct State {
     /// by re-writing the log.
     /// Does not include the space taken up by journal log messages, only the
     /// aggregated file size.
-    redundant_data_bytes_estimate: u128,
+    redundant_data_bytes_estimate: Option<u128>,
+
+    pub(crate) write_counter: u64,
 }
 
 pub type SharedTree = std::sync::Arc<RwLock<State>>;
@@ -43,8 +45,14 @@ impl State {
     pub fn new() -> Self {
         Self {
             tree: BTreeMap::new(),
-            redundant_data_bytes_estimate: 0,
+            redundant_data_bytes_estimate: Some(0),
+            write_counter: 0,
         }
+    }
+
+    pub(crate) fn set_tree(&mut self, tree: BTreeMap<Path, KeyPointer>) {
+        self.tree = tree;
+        self.redundant_data_bytes_estimate = None;
     }
 
     pub fn get_key(&self, path: &str) -> Option<&KeyPointer> {
@@ -79,11 +87,14 @@ impl State {
 
     pub fn add_key(&mut self, path: Path, pointer: KeyPointer) {
         self.tree.insert(path, pointer);
+        self.write_counter += 1;
     }
 
     pub fn remove_key(&mut self, path: &str) -> Option<KeyPointer> {
         if let Some(pointer) = self.tree.remove(path) {
-            self.redundant_data_bytes_estimate += pointer.size as u128;
+            let old = self.redundant_data_bytes_estimate.unwrap_or_default();
+            self.redundant_data_bytes_estimate = Some(old + pointer.size as u128);
+            self.write_counter += 1;
             Some(pointer)
         } else {
             None
@@ -93,6 +104,7 @@ impl State {
     pub fn rename_key(&mut self, old_path: &Path, new_path: Path) -> Result<(), LogFsError> {
         if let Some(old) = self.tree.remove(old_path) {
             self.tree.insert(new_path, old);
+            self.write_counter += 1;
             Ok(())
         } else {
             Err(LogFsError::NotFound {
@@ -102,7 +114,7 @@ impl State {
     }
 
     /// Get a reference to the state's redundant data bytes estimate.
-    pub fn redundant_data_bytes_estimate(&self) -> u128 {
+    pub fn redundant_data_bytes_estimate(&self) -> Option<u128> {
         self.redundant_data_bytes_estimate
     }
 }

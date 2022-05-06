@@ -117,6 +117,8 @@ impl Options {
                     .unwrap_or(NonZeroU32::new(100_000).unwrap()),
             }),
             default_chunk_size: 4_000_000,
+            partial_index_write_interval: 100,
+            full_index_write_interval: 1000,
         }
     }
 }
@@ -173,13 +175,13 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 let content = db.get(&key)?.unwrap();
                 let s = String::from_utf8_lossy(&content);
 
-                if s.contains(&text) {
+                if key.contains(&text) || s.contains(&text) {
                     if delete {
                         db.remove(&key)?;
-                        eprintln!("Deleted: {key}\n");
+                        eprintln!("Deleted: {key}");
                     }
                     if keys_only {
-                        print!("{key} ");
+                        print!("{key}\n");
                     } else {
                         eprintln!("Match {key}:\n{s}\n\n");
                     }
@@ -249,6 +251,8 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 
             eprintln!("Creating new database...");
 
+            let sequence = old_db.superblock()?.active_sequence;
+
             let new_config = LogConfig {
                 path: new_path.into(),
                 raw_mode: false,
@@ -261,6 +265,10 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                         .expect("iterations must be > 0"),
                 }),
                 default_chunk_size: 4_000_000,
+                // There is no point in writing intermediate indexes, so set the
+                // intervals to the current sequence count.
+                partial_index_write_interval: sequence,
+                full_index_write_interval: sequence,
             };
 
             let new_db =
