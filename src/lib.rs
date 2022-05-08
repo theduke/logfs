@@ -314,13 +314,10 @@ impl<J: JournalStore> LogFs<J> {
         let path = path.into();
         let _lock = self.acquire_key_lock();
 
-        eprintln!("writing journal");
         let pointer = self.inner.journal.write_insert(path.clone(), data)?;
 
-        eprintln!("updating state");
         let mut state = self.inner.state.write().unwrap();
         state.add_key(path, pointer);
-        eprintln!("done");
 
         self.write_index_if_required(&mut state)?;
 

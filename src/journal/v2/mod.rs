@@ -80,7 +80,6 @@ impl State {
     fn return_writer(&self, writer: LogWriter) {
         *self.writer.lock().unwrap() = WriterState::Available(Some(writer));
         self.writer_condvar.notify_one();
-        eprintln!("borrowed writer returned");
     }
 
     fn acquire_borrowed_writer(&self) -> Result<LogWriter, LogFsError> {
@@ -93,7 +92,6 @@ impl State {
             match &mut *lock {
                 WriterState::Available(w) => match w.take() {
                     Some(w) => {
-                        eprintln!("borrowed writer acquired");
                         return Ok(w);
                     }
                     None => {
