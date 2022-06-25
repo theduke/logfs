@@ -31,6 +31,8 @@ enum Subcommand {
         value: String,
     },
     Delete {
+        #[structopt(short, long)]
+        prefix: bool,
         keys: Vec<String>,
     },
     /// Compat the log into a new location.
@@ -201,18 +203,27 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 db.insert(key, value.into_bytes())
             }
         }
-        Subcommand::Delete { keys } => {
+        Subcommand::Delete { prefix, keys } => {
             let db = logfs::LogFs::<J>::open(opt.build_config())?;
 
-            for key in keys {
-                if db.get(&key).is_ok() {
-                    db.remove(&key)?;
-                    eprintln!("Key '{}' deleted", key);
-                } else {
-                    eprintln!("Error: Key '{}' does not exist", key);
-                    std::process::exit(1);
+            if prefix {
+                for key in keys {
+                    eprintln!("Deleting keys with prefix '{key}'...");
+                    db.remove_prefix(&key)?;
+                }
+            } else {
+                for key in keys {
+                    if db.get(&key).is_ok() {
+                        db.remove(&key)?;
+                        eprintln!("Key '{}' deleted", key);
+                    } else {
+                        eprintln!("Error: Key '{}' does not exist", key);
+                        std::process::exit(1);
+                    }
                 }
             }
+
+            eprintln!("Complete!");
 
             Ok(())
         }
@@ -326,6 +337,7 @@ fn main() -> Result<(), logfs::LogFsError> {
     let opt = Options::from_args();
 
     tracing_subscriber::fmt::init();
+
     let version = opt.version.unwrap_or(2);
     if version == 2 {
         run::<logfs::Journal2>(opt)
