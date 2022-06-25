@@ -311,6 +311,17 @@ impl Journal2 {
 
         let is_new = !path.exists();
 
+        let is_block_device = {
+            #[cfg(target_os = "unix")]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                meta.file_type().is_block_device()
+            }
+
+            #[cfg(not(target_os = "unix"))]
+            false
+        };
+
         // TODO: use file locks on platforms that support it.
         let mut file = std::fs::OpenOptions::new()
             .create(config.allow_create)
@@ -327,22 +338,11 @@ impl Journal2 {
                 ));
             }
             if (meta.len() as u64) < offset {
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::fs::FileTypeExt;
-                    if meta.file_type().is_block_device() {
-                        // allow
-                    } else {
-                        return Err(LogFsError::new_internal(
-                            "config specified byte offset, but the specified file is smaller  then the offset",
-                        ));
-                    }
+                if !is_block_device {
+                    return Err(LogFsError::new_internal(
+                        "config specified byte offset, but the specified file is smaller  then the offset",
+                    ));
                 }
-
-                #[cfg(not(target_os = "linux"))]
-                return Err(LogFsError::new_internal(
-                    "config specified byte offset, but the specified file is smaller  then the offset",
-                ));
             }
 
             file.seek(io::SeekFrom::Start(offset))?;
