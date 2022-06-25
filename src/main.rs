@@ -325,6 +325,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 fn main() -> Result<(), logfs::LogFsError> {
     let opt = Options::from_args();
 
+    tracing_subscriber::fmt::init();
     let version = opt.version.unwrap_or(2);
     if version == 2 {
         run::<logfs::Journal2>(opt)
