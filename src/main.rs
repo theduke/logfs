@@ -4,14 +4,15 @@ use std::{
 };
 
 use logfs::{CryptoConfig, KeyMeta, LogConfig};
-use structopt::StructOpt;
 
-#[derive(StructOpt, Clone)]
+use clap::Parser;
+
+#[derive(clap::Subcommand, Clone)]
 enum Subcommand {
     List {
-        #[structopt(short, long)]
+        #[clap(short, long)]
         offset: Option<usize>,
-        #[structopt(short, long)]
+        #[clap(short, long)]
         max: Option<usize>,
     },
     Get {
@@ -19,9 +20,9 @@ enum Subcommand {
     },
     Search {
         text: String,
-        #[structopt(long)]
+        #[clap(long)]
         keys_only: bool,
-        #[structopt(long)]
+        #[clap(long)]
         delete: bool,
     },
     Set {
@@ -31,70 +32,70 @@ enum Subcommand {
         value: String,
     },
     Delete {
-        #[structopt(short, long)]
+        #[clap(short, long)]
         prefix: bool,
         keys: Vec<String>,
     },
     /// Compat the log into a new location.
     Compact {
-        #[structopt(long)]
+        #[clap(long)]
         new_path: String,
-        #[structopt(long)]
+        #[clap(long)]
         new_key: String,
-        #[structopt(long)]
+        #[clap(long)]
         new_salt: String,
-        #[structopt(long)]
+        #[clap(long)]
         new_key_iterations: u32,
         new_offset: Option<u64>,
     },
     Migrate {
         // Commented out because there currently is only one log version in the
         // codebase.
-        // #[structopt(long)]
+        // #[clap(long)]
         // new_path: Option<String>,
-        // #[structopt(long)]
+        // #[clap(long)]
         // new_key: Option<String>,
-        // #[structopt(long)]
+        // #[clap(long)]
         // new_salt: Option<String>,
-        // #[structopt(long)]
+        // #[clap(long)]
         // new_iterations: Option<u32>,
     },
     Repair {
-        #[structopt(long)]
+        #[clap(long)]
         overwrite: bool,
-        #[structopt(long)]
+        #[clap(long)]
         start_sequence: Option<u64>,
-        #[structopt(long)]
+        #[clap(long)]
         skip_bytes: Option<u64>,
-        #[structopt(long)]
+        #[clap(long)]
         recovery_path: Option<String>,
     },
 }
 
-#[derive(StructOpt, Clone)]
+#[derive(clap::Parser, Clone)]
 struct Options {
-    #[structopt(short, long)]
+    #[clap(short, long)]
     path: String,
-    #[structopt(long)]
+    #[clap(long)]
     create: bool,
     /// Enables raw mode, which allows using raw block devices without a filesystem.
-    #[structopt(long)]
+    #[clap(long)]
     raw: bool,
     /// Byte offset in the target  file. DB starts at the given offset.
-    #[structopt(long)]
+    #[clap(long)]
     offset: Option<u64>,
 
-    #[structopt(short, long)]
+    #[clap(short, long)]
     key: Option<String>,
-    #[structopt(long)]
+    #[clap(long)]
     salt: Option<String>,
-    #[structopt(long)]
+    #[clap(long)]
     key_iterations: Option<u32>,
 
-    #[structopt(long)]
+    #[clap(long)]
     version: Option<u32>,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     cmd: Subcommand,
 }
 
