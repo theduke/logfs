@@ -154,7 +154,7 @@ type DataOffset = u64;
 impl<J: JournalStore> LogFs<J> {
     // TODO: add open() without key and open_encrypted() with key.
     pub fn open(mut config: LogConfig) -> Result<Self, LogFsError> {
-        tracing::trace!(?config, "opening logfs");
+        tracing::debug!(?config, "opening log");
         let crypto = config
             .crypto
             .take()
@@ -162,6 +162,8 @@ impl<J: JournalStore> LogFs<J> {
         let state = Arc::new(RwLock::new(state::State::new()));
         let path = config.path.clone();
         let journal = J::open(path.clone(), state.clone(), crypto.clone(), &config)?;
+
+        tracing::debug!(?config, "log opened");
 
         Ok(Self {
             path,

@@ -40,11 +40,12 @@ pub fn repair(
 
     let mut entry_and_offset = None;
     loop {
-        let chunk_len = std::cmp::min(100_000_000, file_size - file_offset);
+        let chunk_len = std::cmp::min(100_000, file_size - file_offset);
         if chunk_len == 0 {
             break;
         }
-        tracing::trace!(?sequence, %file_offset, "searching for log entry");
+        let file_progress = format!("{}%", (file_offset / file_size) * 100);
+        tracing::trace!(?sequence, %file_offset, %file_progress, "searching for log entry");
         buffer.resize(chunk_len as usize, 0);
         reader.read_exact(&mut buffer)?;
 

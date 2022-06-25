@@ -122,7 +122,7 @@ fn find_entry_header_in_slice(
 
         for index in 0..=(data.len() - header_len) {
             if index % 100_000 == 0 {
-                tracing::trace!(chunk_index=%index, "trying ty find entry");
+                tracing::trace!(chunk_index=%index, "trying to find entry");
             }
             let mut slice = data[index..index + header_len].to_vec();
             let decrypted =
