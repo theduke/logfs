@@ -311,14 +311,15 @@ impl Journal2 {
 
         let is_new = !path.exists();
 
+        let meta = path.metadata()?;
+
         let is_block_device = {
-            #[cfg(target_os = "unix")]
+            #[cfg(target_os = "linux")]
             {
                 use std::os::unix::fs::FileTypeExt;
                 meta.file_type().is_block_device()
             }
-
-            #[cfg(not(target_os = "unix"))]
+            #[cfg(not(target_os = "linux"))]
             false
         };
 
@@ -329,7 +330,6 @@ impl Journal2 {
             .write(true)
             .open(&path)?;
 
-        let meta = file.metadata()?;
 
         if let Some(offset) = config.offset {
             if is_new {
