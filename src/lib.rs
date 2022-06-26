@@ -314,14 +314,18 @@ impl<J: JournalStore> LogFs<J> {
     /// Insert a key.
     pub fn insert(&self, path: impl Into<String>, data: Vec<u8>) -> Result<(), LogFsError> {
         let path = path.into();
+        let size = data.len();
+        tracing::trace!(?path, size, "inserting key");
         let _lock = self.acquire_key_lock();
 
         let pointer = self.inner.journal.write_insert(path.clone(), data)?;
 
         let mut state = self.inner.state.write().unwrap();
-        state.add_key(path, pointer);
+        state.add_key(path.clone(), pointer);
 
         self.write_index_if_required(&mut state)?;
+
+        tracing::trace!(?path, size, "key inserted");
 
         Ok(())
     }
