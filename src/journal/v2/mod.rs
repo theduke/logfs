@@ -586,6 +586,24 @@ impl Journal2 {
         Ok(())
     }
 
+    pub fn write_batch(&self, batch: crate::Batch) -> Result<(), LogFsError> {
+        let renames = batch
+            .renames
+            .into_iter()
+            .map(|rename| data::KeyRename {
+                old_key: rename.old_key,
+                new_key: rename.new_key,
+            })
+            .collect();
+        let action = data::JournalAction::Batch(data::ActionBatch {
+            renames,
+            deleted_keys: batch.deleted_keys,
+        });
+
+        self.write_entry(action, None, 0)?;
+        Ok(())
+    }
+
     pub fn write_remove(&self, deleted_keys: Vec<data::KeyPath>) -> Result<(), LogFsError> {
         let action = data::JournalAction::KeyDelete(data::ActionKeyDelete { deleted_keys });
         self.write_entry(action, None, 0)?;
@@ -650,7 +668,21 @@ fn apply_entry(state: &mut crate::state::State, entry: PersistedEntry) -> Result
                 }
             }
         }
+
         data::JournalAction::IndexWrite(_) => {}
+        data::JournalAction::Batch(batch) => {
+            for deleted_key in &batch.deleted_keys {
+                if state.remove_key(deleted_key).is_none() {
+                    tracing::trace!("Log entry tried to delete a key that does not exist");
+                }
+            }
+
+            for rename in batch.renames {
+                if let Err(_err) = state.rename_key(&rename.old_key, rename.new_key) {
+                    tracing::trace!("Log entry tried to rename a key that does not exist");
+                }
+            }
+        }
     }
 
     Ok(())
@@ -717,6 +749,10 @@ impl super::JournalStore for Journal2 {
 
     fn write_remove(&self, paths: Vec<crate::Path>) -> Result<(), LogFsError> {
         self.write_remove(paths)
+    }
+
+    fn write_batch(&self, batch: crate::Batch) -> Result<(), LogFsError> {
+        self.write_batch(batch)
     }
 
     fn read_data(&self, pointer: &KeyPointer) -> Result<Vec<u8>, LogFsError> {

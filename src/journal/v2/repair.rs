@@ -119,6 +119,19 @@ pub fn repair(
                 }
             }
             data::JournalAction::IndexWrite(_) => {}
+            data::JournalAction::Batch(batch) => {
+                for rename in batch.renames {
+                    if let Err(_err) = state.rename_key(&rename.old_key, rename.new_key) {
+                        tracing::trace!("Log entry tried to rename a key that does not exist");
+                    }
+                }
+
+                for deleted_key in &batch.deleted_keys {
+                    if state.remove_key(deleted_key).is_none() {
+                        tracing::trace!("Log entry tried to delete a key that does not exist");
+                    }
+                }
+            }
         };
 
         // TODO: handle error

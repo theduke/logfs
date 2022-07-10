@@ -143,6 +143,18 @@ pub struct ActionIndexWrite {
     pub compression: Option<CompressionFormat>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub enum BatchItem {
+    Rename(KeyRename),
+    Delete(ActionKeyDelete),
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct ActionBatch {
+    pub renames: Vec<KeyRename>,
+    pub deleted_keys: Vec<String>,
+}
+
 /// A file action in the log/journal.
 ///
 /// Actions are written to files in a (de)serialized encoding.
@@ -156,6 +168,8 @@ pub enum JournalAction {
     KeyDelete(ActionKeyDelete),
     /// Persist a new full keyspace index.
     IndexWrite(ActionIndexWrite),
+    /// A batch of multiple key renames and deletes.
+    Batch(ActionBatch),
 }
 
 impl JournalAction {
@@ -167,6 +181,7 @@ impl JournalAction {
             }
             Self::KeyRename(_) => 0,
             Self::KeyDelete(_) => 0,
+            Self::Batch(_) => 0,
             Self::IndexWrite(w) => {
                 let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as u64;
                 w.size + padding

@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf, sync::Arc};
 use crate::{
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
-    KeyLock, LogConfig, LogFsError,
+    Batch, KeyLock, LogConfig, LogFsError,
 };
 
 use self::v2::{
@@ -91,6 +91,8 @@ pub trait JournalStore {
     ) -> Result<(), LogFsError>
     where
         Self: Sized;
+
+    fn write_batch(&self, batch: Batch) -> Result<(), LogFsError>;
 
     fn write_insert(&self, path: Path, data: Vec<u8>) -> Result<KeyPointer, LogFsError>;
 

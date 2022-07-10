@@ -412,6 +412,44 @@ impl<J: JournalStore> LogFs<J> {
         Ok(())
     }
 
+    pub fn batch(&self, batch: Batch) -> Result<(), LogFsError> {
+        let state = self.inner.state.write().unwrap();
+
+        // Validate.
+
+        for deleted_key in &batch.deleted_keys {
+            if state.get_key(&deleted_key).is_none() {
+                return Err(LogFsError::NotFound {
+                    path: deleted_key.clone(),
+                });
+            }
+        }
+
+        for rename in &batch.renames {
+            if state.get_key(&rename.old_key).is_none() {
+                return Err(LogFsError::NotFound {
+                    path: rename.old_key.clone(),
+                });
+            }
+        }
+
+        self.inner.journal.write_batch(batch.clone())?;
+
+        let mut state = state;
+
+        for key in &batch.deleted_keys {
+            state.remove_key(key);
+        }
+        for rename in batch.renames {
+            // Unwrap is fine since key existence was validated above.
+            state.rename_key(&rename.old_key, rename.new_key).unwrap();
+        }
+
+        self.write_index_if_required(&mut state)?;
+
+        Ok(())
+    }
+
     pub fn size_data(&self) -> Result<u64, LogFsError> {
         let size = self
             .inner
@@ -427,6 +465,37 @@ impl<J: JournalStore> LogFs<J> {
 
     pub fn size_log(&self) -> Result<u64, LogFsError> {
         self.inner.journal.size_log()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Rename {
+    pub old_key: String,
+    pub new_key: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Batch {
+    pub renames: Vec<Rename>,
+    pub deleted_keys: Vec<String>,
+}
+
+impl Batch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn and_rename(mut self, old_key: impl Into<String>, new_key: impl Into<String>) -> Self {
+        self.renames.push(Rename {
+            old_key: old_key.into(),
+            new_key: new_key.into(),
+        });
+        self
+    }
+
+    pub fn and_remove(mut self, keys: Vec<String>) -> Self {
+        self.deleted_keys.extend(keys);
+        self
     }
 }
 
@@ -875,6 +944,47 @@ mod tests {
             } else {
                 assert_eq!(db.get(x.to_string()).unwrap(), None);
             }
+        }
+    }
+
+    #[test]
+    fn test_batch_writes() {
+        let config = test_config("batch_writes");
+
+        {
+            let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+            for x in 1..20 {
+                let val = format!("k{x}");
+                db.insert(&val, val.as_bytes().to_vec()).unwrap();
+            }
+
+            let batch = Batch::new()
+                .and_rename("k1", "n1")
+                .and_rename("k2", "n2")
+                .and_remove(vec!["k3".to_string(), "k4".to_string(), "k5".to_string()])
+                .and_rename("k6", "n6")
+                .and_remove(vec!["k7".to_string()]);
+
+            db.batch(batch).unwrap();
+
+            assert_eq!(db.get("n1").unwrap().unwrap(), b"k1");
+            assert_eq!(db.get("n2").unwrap().unwrap(), b"k2");
+            assert_eq!(db.get("n6").unwrap().unwrap(), b"k6");
+
+            assert_eq!(db.get("k4").unwrap(), None);
+            assert_eq!(db.get("k5").unwrap(), None);
+            assert_eq!(db.get("k7").unwrap(), None);
+        }
+
+        {
+            let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+            assert_eq!(db.get("n1").unwrap().unwrap(), b"k1");
+            assert_eq!(db.get("n2").unwrap().unwrap(), b"k2");
+            assert_eq!(db.get("n6").unwrap().unwrap(), b"k6");
+
+            assert_eq!(db.get("k4").unwrap(), None);
+            assert_eq!(db.get("k5").unwrap(), None);
+            assert_eq!(db.get("k7").unwrap(), None);
         }
     }
 }
