@@ -67,6 +67,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn full_index_write_interval(mut self, interval: u64) -> Self {
+        self.config.full_index_write_interval = interval;
+        self
+    }
+
     pub fn build(self) -> LogConfig {
         self.config
     }
