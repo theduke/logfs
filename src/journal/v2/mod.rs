@@ -305,98 +305,71 @@ impl Journal2 {
             }
         }
 
-        if path.is_dir() {
-            return Err(LogFsError::new_internal("Database path is a directory"));
-        }
-
-        let is_new = !path.exists();
-
-        let meta = path.metadata()?;
-
-        let is_block_device = {
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::unix::fs::FileTypeExt;
-                meta.file_type().is_block_device()
-            }
-            #[cfg(not(target_os = "linux"))]
-            false
+        let meta_opt = match path.metadata() {
+            Ok(m) => Some(m),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
         };
 
-        // TODO: use file locks on platforms that support it.
-        let mut file = std::fs::OpenOptions::new()
-            .create(config.allow_create)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-
-
-        if let Some(offset) = config.offset {
-            if is_new {
-                return Err(LogFsError::new_internal(
-                    "config specified byte offset, but the specified file does not exist",
-                ));
+        let tainted = write::TaintedFlag::new();
+        let writer = if let Some(meta) = meta_opt {
+            if path.is_dir() {
+                return Err(LogFsError::new_internal("Database path is a directory"));
             }
-            if (meta.len() as u64) < offset {
-                if !is_block_device {
-                    return Err(LogFsError::new_internal(
+
+            let is_block_device = {
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    meta.file_type().is_block_device()
+                }
+                #[cfg(not(target_os = "linux"))]
+                false
+            };
+
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+
+            if let Some(offset) = config.offset {
+                if (meta.len() as u64) < offset {
+                    if !is_block_device {
+                        return Err(LogFsError::new_internal(
                         "config specified byte offset, but the specified file is smaller  then the offset",
                     ));
-                }
-            }
-
-            file.seek(io::SeekFrom::Start(offset))?;
-        }
-
-        let base_offset = config.offset.unwrap_or_default();
-        let file_len = file.metadata()?.len();
-
-        let tainted = write::TaintedFlag::new();
-
-        tracing::trace!(?path, "opening logfs");
-
-        let writer = if config.raw_mode {
-            let mut state = tree.write().unwrap();
-
-            match Self::open_existing(file, &mut state, &crypto, base_offset, &tainted) {
-                Ok(w) => w,
-                Err(_err) => {
-                    if config.allow_create {
-                        let mut file = std::fs::OpenOptions::new()
-                            .create(true)
-                            .read(true)
-                            .write(true)
-                            .open(&path)?;
-
-                        file.seek(SeekFrom::Start(base_offset))?;
-
-                        LogWriter::create_new(crypto.clone(), tainted.clone(), file, base_offset)?
-                    } else {
-                        return Err(LogFsError::new_internal(
-                            "Could not open database: file does not appear to be a log",
-                        ));
                     }
                 }
+
+                file.seek(io::SeekFrom::Start(offset))?;
             }
-        } else if is_new || file_len == base_offset {
-            if config.allow_create {
-                tracing::trace!(?path, "creating new log");
-                LogWriter::create_new(
-                    crypto.clone(),
-                    tainted.clone(),
-                    file,
-                    config.offset.unwrap_or_default(),
-                )?
-            } else {
-                return Err(LogFsError::new_internal(format!(
-                    "No log found at {}",
-                    config.path.display()
-                )));
-            }
-        } else {
-            tracing::trace!(?path, "opening existing log");
+
             let mut state = tree.write().unwrap();
-            Self::open_existing(file, &mut state, &crypto, base_offset, &tainted)?
+
+            Self::open_existing(
+                file,
+                &mut state,
+                &crypto,
+                config.offset.unwrap_or_default(),
+                &tainted,
+            )?
+        } else {
+            if config.offset.is_some() {
+                return Err(LogFsError::new_internal("Specified offset for new file - offset is only valid for existing files that are as large as the given offset"));
+            }
+
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+
+            LogWriter::create_new(
+                crypto.clone(),
+                tainted.clone(),
+                file,
+                config.offset.unwrap_or_default(),
+            )?
         };
 
         let j = Self {
