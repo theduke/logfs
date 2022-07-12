@@ -393,21 +393,24 @@ impl<J: JournalStore> LogFs<J> {
 
     /// Remove a whole key prefix.
     pub fn remove_prefix(&self, prefix: impl AsRef<str>) -> Result<(), LogFsError> {
+        let prefix = prefix.as_ref();
         let state = self.inner.state.write().unwrap();
-        let paths = state.paths_prefix(prefix.as_ref());
+        let paths = state.paths_prefix(prefix);
+
+        tracing::trace!(%prefix, key_count=%paths.len(), "deleting keys with prefix");
 
         if !paths.is_empty() {
             let _lock = self.acquire_key_lock();
             std::mem::drop(state);
             self.inner.journal.write_remove(paths.clone())?;
-        }
 
-        let mut state = self.inner.state.write().unwrap();
-        for path in paths {
-            state.remove_key(&path);
-        }
+            let mut state = self.inner.state.write().unwrap();
+            for path in paths {
+                state.remove_key(&path);
+            }
 
-        self.write_index_if_required(&mut state)?;
+            self.write_index_if_required(&mut state)?;
+        }
 
         Ok(())
     }
