@@ -497,6 +497,8 @@ impl Journal2 {
     ) -> Result<(), LogFsError> {
         // TODO: implement partial writes.
 
+        tracing::trace!("starting full index write");
+
         let index = data::KeyIndex {
             parent_entry: None,
             keys: tree
@@ -511,6 +513,9 @@ impl Journal2 {
                 .collect(),
         };
         let data = bincode::serialize(&index)?;
+        tracing::trace!(size_bytes=%data.len(), "compressing index payload...");
+
+        let original_size = data.len();
         // Compress.
         let (data, compression) = {
             let mut buffer = Cursor::new(Vec::<u8>::new());
@@ -523,10 +528,11 @@ impl Journal2 {
 
             (buffer.into_inner(), data::CompressionFormat::Brotli)
         };
-
-        // TODO: compression
+        tracing::trace!(original_size=%original_size, compressed_size=%data.len(), "index payload compressed...");
 
         let hash = data::Sha256Hash(sha2::Sha256::digest(&data).into());
+
+        let size = data.len();
 
         let action = data::JournalAction::IndexWrite(data::ActionIndexWrite {
             size: data.len() as u64,
@@ -537,6 +543,8 @@ impl Journal2 {
         let chunk_size = data.len();
 
         self.write_entry(action, Some(data), chunk_size as u32)?;
+
+        tracing::debug!(size_bytes=%size, "finished full index write");
 
         Ok(())
     }
