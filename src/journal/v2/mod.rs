@@ -523,7 +523,10 @@ impl Journal2 {
             brotli::BrotliCompress(
                 &mut input,
                 &mut buffer,
-                &brotli::enc::BrotliEncoderInitParams(),
+                &brotli::enc::BrotliEncoderParams {
+                    quality: 8,
+                    ..brotli::enc::BrotliEncoderInitParams()
+                },
             )?;
 
             (buffer.into_inner(), data::CompressionFormat::Brotli)
