@@ -36,6 +36,13 @@ enum Subcommand {
         prefix: bool,
         keys: Vec<String>,
     },
+    /// Replace a matching text with the given replacement in all keys that start with the given prefix.
+    TextMatchReplace {
+        #[clap(long)]
+        key_prefix: String,
+        match_text: String,
+        replacement: String,
+    },
     /// Compat the log into a new location.
     Compact {
         #[clap(long)]
@@ -329,6 +336,34 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 
             eprintln!("Complete!");
 
+            Ok(())
+        }
+        Subcommand::TextMatchReplace {
+            key_prefix,
+            match_text,
+            replacement,
+        } => {
+            eprintln!("Opening database...");
+            let db = logfs::LogFs::<J>::open(opt.build_config())?;
+
+            eprintln!(
+                "Replacing '{match_text}' with '{replacement}' in keys starting with '{key_prefix}"
+            );
+            let mut count = 0;
+            for key in db.paths_prefix(&key_prefix)? {
+                let content = db.get(&key)?.unwrap();
+
+                if let Ok(s) = String::from_utf8(content) {
+                    if s.contains(&match_text) {
+                        let new = s.replace(&match_text, &replacement);
+                        eprintln!("Replacing in key '{key}'");
+                        db.insert(key, new.into_bytes())?;
+                        count += 1;
+                    }
+                }
+            }
+
+            eprintln!("Replaced '{match_text}' with '{replacement}' in {count} objects");
             Ok(())
         }
     }
