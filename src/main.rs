@@ -121,7 +121,7 @@ impl Options {
             }),
             default_chunk_size: 4_000_000,
             partial_index_write_interval: 100,
-            full_index_write_interval: 1000,
+            full_index_write_interval: 10_000,
         }
     }
 }
