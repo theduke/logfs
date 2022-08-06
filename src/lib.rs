@@ -38,6 +38,7 @@ impl ConfigBuilder {
                 // TODO: determine good defaults for these values!
                 partial_index_write_interval: 100,
                 full_index_write_interval: 1000,
+                readonly: false,
             },
         }
     }
@@ -72,6 +73,11 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn readonly(mut self, readonly: bool) -> Self {
+        self.config.readonly = readonly;
+        self
+    }
+
     pub fn build(self) -> LogConfig {
         self.config
     }
@@ -102,6 +108,7 @@ pub struct LogConfig {
     /// Determines after how many journal entries a new full index snapshot is
     /// written.
     pub full_index_write_interval: u64,
+    pub readonly: bool,
 }
 
 pub struct RepairConfig {
@@ -318,6 +325,9 @@ impl<J: JournalStore> LogFs<J> {
 
     /// Insert a key.
     pub fn insert(&self, path: impl Into<String>, data: Vec<u8>) -> Result<(), LogFsError> {
+        if self.inner.config.readonly {
+            return Err(LogFsError::ReadOnly);
+        }
         let path = path.into();
         let size = data.len();
         tracing::trace!(?path, size, "inserting key");
@@ -351,6 +361,9 @@ impl<J: JournalStore> LogFs<J> {
         old_key: impl Into<String>,
         new_key: impl Into<String>,
     ) -> Result<(), LogFsError> {
+        if self.inner.config.readonly {
+            return Err(LogFsError::ReadOnly);
+        }
         let old_key = old_key.into();
         let new_key = new_key.into();
 
@@ -377,6 +390,9 @@ impl<J: JournalStore> LogFs<J> {
 
     /// Remove a key.
     pub fn remove(&self, path: impl AsRef<str>) -> Result<(), LogFsError> {
+        if self.inner.config.readonly {
+            return Err(LogFsError::ReadOnly);
+        }
         let path = path.as_ref();
 
         let mut state = self.inner.state.write().unwrap();
@@ -393,6 +409,9 @@ impl<J: JournalStore> LogFs<J> {
 
     /// Remove a whole key prefix.
     pub fn remove_prefix(&self, prefix: impl AsRef<str>) -> Result<(), LogFsError> {
+        if self.inner.config.readonly {
+            return Err(LogFsError::ReadOnly);
+        }
         let prefix = prefix.as_ref();
         let state = self.inner.state.write().unwrap();
         let paths = state.paths_prefix(prefix);
@@ -416,6 +435,10 @@ impl<J: JournalStore> LogFs<J> {
     }
 
     pub fn batch(&self, batch: Batch) -> Result<(), LogFsError> {
+        if self.inner.config.readonly {
+            return Err(LogFsError::ReadOnly);
+        }
+
         let state = self.inner.state.write().unwrap();
 
         // Validate.

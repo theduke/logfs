@@ -1,5 +1,6 @@
 #[derive(Debug)]
 pub enum LogFsError {
+    ReadOnly,
     NotFound {
         path: super::Path,
     },
@@ -48,6 +49,7 @@ impl std::fmt::Display for LogFsError {
                 "The database is tainted and can not be used for writes until re-initialization."
             ),
             LogFsError::WriterClosed => write!(f, "Log was closed for writes"),
+            LogFsError::ReadOnly => write!(f, "Could not insert: log is read-only"),
         }
     }
 }
@@ -61,6 +63,7 @@ impl std::error::Error for LogFsError {
             LogFsError::NotFound { path: _ } => None,
             LogFsError::Tainted => None,
             LogFsError::WriterClosed => None,
+            LogFsError::ReadOnly => None,
         }
     }
 }

@@ -109,6 +109,7 @@ struct Options {
 impl Options {
     fn build_config(&self) -> logfs::LogConfig {
         logfs::LogConfig {
+            readonly: false,
             offset: self.offset,
             path: self.path.clone().into(),
             raw_mode: self.raw,
@@ -273,6 +274,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             let sequence = old_db.superblock()?.active_sequence;
 
             let new_config = LogConfig {
+                readonly: false,
                 path: new_path.into(),
                 raw_mode: false,
                 offset: new_offset,
