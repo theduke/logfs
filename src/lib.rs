@@ -548,6 +548,7 @@ mod tests {
             offset: None,
             raw_mode: false,
             allow_create: true,
+            readonly: false,
             crypto: Some(CryptoConfig {
                 key: "logfs".to_string().into(),
                 salt: b"salt".to_vec().into(),
