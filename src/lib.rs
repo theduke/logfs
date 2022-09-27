@@ -173,9 +173,9 @@ impl<J: JournalStore> LogFs<J> {
             .map(|c| Arc::new(crypto::Crypto::new(c)));
         let state = Arc::new(RwLock::new(state::State::new()));
         let path = config.path.clone();
-        let journal = J::open(path.clone(), state.clone(), crypto.clone(), &config)?;
+        let journal = J::open(path.clone(), state.clone(), crypto, &config)?;
 
-        tracing::debug!(?config, "log opened");
+        tracing::info!(?config, "log opened");
 
         Ok(Self {
             path,
