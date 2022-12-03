@@ -372,7 +372,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 }
 
 fn main() -> Result<(), logfs::LogFsError> {
-    let opt = Options::from_args();
+    let opt = Options::parse();
 
     tracing_subscriber::fmt::init();
 
