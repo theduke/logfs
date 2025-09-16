@@ -246,7 +246,10 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             recovery_path,
             skip_bytes,
         } => {
-            std::env::set_var("RUST_LOG", "logfs=trace");
+            // Edition 2024 marks set_var unsafe to highlight potential data races.
+            unsafe {
+                std::env::set_var("RUST_LOG", "logfs=trace");
+            }
             tracing_subscriber::fmt::init();
 
             let config = opt.build_config();

@@ -318,12 +318,20 @@ dependencies = [
  "bincode",
  "bitflags",
  "brotli",
- "clap",
  "generic-array",
  "ring",
  "serde",
  "sha2",
  "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "logfs-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "logfs",
  "tracing-subscriber",
  "zeroize",
 ]
