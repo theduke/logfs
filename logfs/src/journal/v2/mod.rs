@@ -818,7 +818,9 @@ impl super::JournalStore for Journal2 {
 
     fn supberlock(&self) -> Result<Superblock, LogFsError> {
         let writer = self.state.acquire_borrowed_writer()?;
-        Ok(writer.active_superblock().block.clone())
+        let block = writer.active_superblock().block.clone();
+        self.state.return_writer(writer);
+        Ok(block)
     }
 
     fn write_index(
