@@ -118,3 +118,9 @@ impl State {
         self.redundant_data_bytes_estimate
     }
 }
+
+impl Default for State {
+    fn default() -> Self {
+        Self::new()
+    }
+}

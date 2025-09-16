@@ -85,6 +85,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         Ok(block)
     }
 
+    #[allow(dead_code)]
     pub(super) fn rewind_to_first_entry(&mut self) -> Result<(), LogFsError> {
         let target = self.base_offset + data::Superblock::HEADER_SIZE;
         self.reader.seek(io::SeekFrom::Start(target))?;
@@ -139,14 +140,14 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         // Read journal entry header.
         buffer.resize(header_size, 0);
 
-        self.reader.read_exact(buffer)?;
+        self.reader.read_exact(&mut *buffer)?;
 
         let header_data = if let Some(crypto) = &self.crypto {
             crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_HEADER_CHUNK, buffer)?
         } else {
-            &buffer
+            buffer.as_slice()
         };
-        let header: data::JournalEntryHeader = bincode::deserialize(&header_data)?;
+        let header: data::JournalEntryHeader = bincode::deserialize(header_data)?;
         tracing::trace!(?header, "read entry header");
 
         if sequence != header.sequence_id {
@@ -175,11 +176,11 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         let action_data = if let Some(crypto) = &self.crypto {
             crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_ACTION_CHUNK, buffer)?
         } else {
-            &buffer
+            buffer.as_slice()
         };
 
         let action: data::JournalAction = bincode::deserialize(action_data)?;
-        let data_len = action.payload_len(self.crypto.clone());
+        let data_len = action.payload_len(self.crypto);
 
         let data_offset = start_offset + header_size as u64 + action_size as u64;
         let next_entry_offset = data_offset + data_len;
@@ -273,7 +274,7 @@ impl KeyDataReader {
 
     fn read_next_chunk(&mut self, mut buffer: Vec<u8>) -> Result<Vec<u8>, LogFsError> {
         debug_assert!(self.next_chunk >= ENTRY_FIRST_DATA_CHUNK);
-        assert!(self.next_chunk <= self.last_chunk_index as u32);
+        assert!(self.next_chunk <= self.last_chunk_index);
 
         let chunk = self.next_chunk;
         let is_last = chunk == self.last_chunk_index;
@@ -306,7 +307,7 @@ impl KeyDataReader {
             buffer
         };
 
-        self.next_chunk = self.next_chunk + 1;
+        self.next_chunk += 1;
 
         Ok(data)
     }
@@ -418,7 +419,7 @@ impl KeyChunkIter {
     }
 
     pub fn skip_bytes(&mut self, offset: u64) -> Result<(), LogFsError> {
-        let to_skip = u32::try_from(offset as u64 / self.reader.chunk_size as u64)
+        let to_skip = u32::try_from(offset / self.reader.chunk_size as u64)
             .map_err(|_| LogFsError::new_internal("Seek out of bounds"))?;
         self.reader.skip_chunks(to_skip)?;
 

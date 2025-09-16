@@ -372,7 +372,7 @@ impl<J: JournalStore> LogFs<J> {
         // Ensure key exists.
         if self.inner.state.read().unwrap().get_key(&old_key).is_none() {
             return Err(LogFsError::NotFound {
-                path: old_key.into(),
+                path: old_key.to_string(),
             });
         }
 
@@ -444,7 +444,7 @@ impl<J: JournalStore> LogFs<J> {
         // Validate.
 
         for deleted_key in &batch.deleted_keys {
-            if state.get_key(&deleted_key).is_none() {
+            if state.get_key(deleted_key).is_none() {
                 return Err(LogFsError::NotFound {
                     path: deleted_key.clone(),
                 });
@@ -882,9 +882,9 @@ mod tests {
         let path = "a";
         db.insert(path, data.as_bytes().to_vec()).unwrap();
 
-        assert_eq!(&db.get(&path).unwrap().unwrap(), data.as_bytes());
+        assert_eq!(&db.get(path).unwrap().unwrap(), data.as_bytes());
 
-        let mut chunks = db.get_chunks(&path).unwrap();
+        let mut chunks = db.get_chunks(path).unwrap();
         assert_eq!(&chunks.next().unwrap().unwrap(), b"000");
 
         chunks.skip_bytes(6).unwrap();

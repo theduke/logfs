@@ -28,7 +28,7 @@ impl LogFsError {
     pub(crate) fn into_io(self) -> std::io::Error {
         match self {
             LogFsError::Io { error, .. } => error,
-            other => std::io::Error::new(std::io::ErrorKind::Other, other),
+            other => std::io::Error::other(other),
         }
     }
 }

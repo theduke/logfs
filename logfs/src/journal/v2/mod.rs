@@ -133,7 +133,7 @@ fn find_entry_header_in_slice(
                     }
                 };
 
-            match bincode::deserialize::<data::JournalEntryHeader>(&decrypted) {
+            match bincode::deserialize::<data::JournalEntryHeader>(decrypted) {
                 Ok(header) => return Some((header, index as u64)),
                 Err(_) => continue,
             }
@@ -188,7 +188,7 @@ fn read_entry_header(
     let data = if let Some(crypto) = &crypto {
         crypto.decrypt_data_ref(sequence.as_u64(), ENTRY_HEADER_CHUNK, buffer)?
     } else {
-        &buffer
+        buffer
     };
 
     let header: data::JournalEntryHeader = bincode::deserialize(data)?;
@@ -212,7 +212,7 @@ fn read_entry_action(
     let action_data = if let Some(crypto) = &crypto {
         crypto.decrypt_data_ref(header.sequence_id.as_u64(), ENTRY_ACTION_CHUNK, buffer)?
     } else {
-        &buffer
+        buffer
     };
 
     let action: data::JournalAction = bincode::deserialize(action_data)?;
@@ -282,7 +282,7 @@ fn restore_index<R: io::Read + io::Seek>(
             _ => {
                 return Err(LogFsError::new_internal(
                     "Invalid index pointer: log entry is not an index",
-                ))?;
+                ));
             }
         }
     }
@@ -333,12 +333,10 @@ impl Journal2 {
                 .open(&path)?;
 
             if let Some(offset) = config.offset {
-                if (meta.len() as u64) < offset {
-                    if !is_block_device {
-                        return Err(LogFsError::new_internal(
-                            "config specified byte offset, but the specified file is smaller  then the offset",
-                        ));
-                    }
+                if meta.len() < offset && !is_block_device {
+                    return Err(LogFsError::new_internal(
+                        "config specified byte offset, but the specified file is smaller  then the offset",
+                    ));
                 }
 
                 file.seek(io::SeekFrom::Start(offset))?;
@@ -362,6 +360,7 @@ impl Journal2 {
 
             let file = std::fs::OpenOptions::new()
                 .create(true)
+                .truncate(false)
                 .read(true)
                 .write(true)
                 .open(&path)?;
@@ -773,11 +772,11 @@ impl super::JournalStore for Journal2 {
     }
 
     fn reader(&self, pointer: &KeyPointer) -> Result<read::StdKeyReader, LogFsError> {
-        Journal2::reader(&self, pointer)
+        Journal2::reader(self, pointer)
     }
 
     fn read_chunks(&self, pointer: &KeyPointer) -> Result<read::KeyChunkIter, LogFsError> {
-        Journal2::chunk_iter(&self, pointer)
+        Journal2::chunk_iter(self, pointer)
     }
 
     fn size_log(&self) -> Result<u64, LogFsError> {

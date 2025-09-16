@@ -50,7 +50,7 @@ pub fn repair(
         reader.read_exact(&mut buffer)?;
 
         if let Some((header, buffer_offset)) =
-            find_entry_header_in_slice(crypto.as_ref().map(|c| &**c), sequence, &buffer)
+            find_entry_header_in_slice(crypto.as_deref(), sequence, &buffer)
         {
             entry_and_offset = Some((header, file_offset + buffer_offset));
             break;
@@ -66,14 +66,14 @@ pub fn repair(
 
     reader.seek(SeekFrom::Start(offset))?;
 
-    let crypto_ref = crypto.as_ref().map(|c| &**c);
+    let crypto_ref = crypto.as_deref();
 
     let mut buffer = Vec::new();
     let mut sequence = header.sequence_id;
     let mut state = crate::state::State::new();
 
     loop {
-        let entry = match read_entry(&mut reader, &mut buffer, crypto_ref.clone(), sequence) {
+        let entry = match read_entry(&mut reader, &mut buffer, crypto_ref, sequence) {
             Ok(entry) => entry,
             Err(error) => {
                 tracing::warn!(?error, "could not read entry. stopping read recovery");
@@ -83,7 +83,7 @@ pub fn repair(
 
         let data_offset = reader.stream_position()?;
 
-        let payload_len = entry.action.payload_len(crypto_ref.clone());
+        let payload_len = entry.action.payload_len(crypto_ref);
         if let Err(error) = reader.seek(SeekFrom::Current(payload_len as i64)) {
             tracing::warn!(
                 ?entry,

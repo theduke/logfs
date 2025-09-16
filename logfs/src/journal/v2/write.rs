@@ -105,7 +105,7 @@ impl LogWriter {
                     format_version: data::LogFormatVersion::V2,
                     flags: data::SuperblockFlags::empty(),
                     active_sequence: 0,
-                    tail_offset: data::Superblock::HEADER_SIZE as u64,
+                    tail_offset: data::Superblock::HEADER_SIZE,
                     last_index_entry: None,
                 },
                 index: 0,
@@ -144,7 +144,6 @@ impl LogWriter {
             actions_since_last_index_write: block
                 .block
                 .last_index_entry
-                .clone()
                 .map(|entry| block.block.active_sequence - entry.sequence.as_u64())
                 .unwrap_or(block.block.active_sequence),
             active_superblock: block,
@@ -156,7 +155,7 @@ impl LogWriter {
     }
 
     fn crypto(&self) -> Option<&Crypto> {
-        self.crypto.as_ref().map(|x| &**x)
+        self.crypto.as_deref()
     }
 
     fn data_padding(&self) -> u64 {
@@ -194,8 +193,7 @@ impl LogWriter {
                 tail_offset: self.offset - self.base_offset,
                 last_index_entry: self
                     .last_written_index
-                    .clone()
-                    .or_else(|| self.active_superblock.block.last_index_entry.clone()),
+                    .or(self.active_superblock.block.last_index_entry),
             },
         };
         self.apply_superblock(block)
@@ -212,9 +210,9 @@ impl LogWriter {
     }
 
     fn try_apply_superblock(&mut self, block: IndexedSuperBlock) -> Result<(), LogFsError> {
-        assert_eq!(self.tainted.is_tainted(), false);
+        assert!(!self.tainted.is_tainted());
 
-        debug_assert_eq!(self.incomplete_entry_in_progress, false);
+        debug_assert!(!self.incomplete_entry_in_progress);
         debug_assert_eq!(block.block.active_sequence, self.next_sequence.as_u64() - 1);
         debug_assert_eq!(block.block.tail_offset, self.offset - self.base_offset);
         if let Some(ptr) = &block.block.last_index_entry {
@@ -315,8 +313,8 @@ impl LogWriter {
         action: &data::JournalAction,
         incomplete: bool,
     ) -> Result<data::JournalEntryHeader, LogFsError> {
-        assert_eq!(self.tainted.is_tainted(), false);
-        debug_assert_eq!(self.incomplete_entry_in_progress, false);
+        assert!(!self.tainted.is_tainted());
+        debug_assert!(!self.incomplete_entry_in_progress);
         debug_assert_eq!(self.offset, self.writer.stream_position()?);
 
         let sequence = self.next_sequence;
@@ -399,7 +397,7 @@ impl LogWriter {
         chunk: data::ChunkIndex,
         data: &mut Vec<u8>,
     ) -> Result<ByteCountU64, LogFsError> {
-        debug_assert_eq!(self.incomplete_entry_in_progress, true);
+        debug_assert!(self.incomplete_entry_in_progress);
         debug_assert!(chunk >= ENTRY_FIRST_DATA_CHUNK);
 
         if let Some(crypto) = self.crypto.as_ref() {
@@ -407,7 +405,7 @@ impl LogWriter {
         }
         let len = data.len() as u64;
 
-        self.writer.write_all(&data)?;
+        self.writer.write_all(data)?;
         self.offset += len;
 
         Ok(len)
@@ -536,8 +534,7 @@ pub struct KeyWriter {
 
 impl KeyWriter {
     pub fn new(writer: LogChunkWriter, lock: Option<KeyLock>) -> Self {
-        let mut buffer = Vec::new();
-        buffer.resize(writer.chunk_size as usize, 0);
+        let buffer = vec![0; writer.chunk_size as usize];
         Self {
             buffer,
             writer: Some(writer),

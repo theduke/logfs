@@ -57,8 +57,7 @@ impl Crypto {
     fn build_entry_nonce(sequence: u64) -> aead::Nonce {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[0..8].copy_from_slice(&sequence.to_le_bytes());
-        let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
-        nonce
+        aead::Nonce::assume_unique_for_key(nonce_bytes)
     }
 
     /// Build the decryption nonce for a chunk of the raw data of a given
@@ -82,7 +81,7 @@ impl Crypto {
         &self,
         sequence: u64,
         header_data: &[u8],
-        buffer: &'a mut Vec<u8>,
+        buffer: &'a mut [u8],
     ) -> Result<(&'a [u8], NextEntryOffset), LogFsError> {
         let nonce = Self::build_entry_nonce(sequence);
         let aad = aead::Aad::from(header_data);

@@ -76,9 +76,7 @@ impl KeyMeta {
 }
 
 pub fn compute_chunk_count(data_size: ByteCountU64, chunk_size: ByteCountU32) -> ChunkIndex {
-    // TODO: use .div_ceil() once stabilized
-    // https://github.com/rust-lang/rust/issues/88581
-    ((data_size + chunk_size as u64 - 1) / chunk_size as u64) as ChunkIndex
+    data_size.div_ceil(chunk_size as u64) as ChunkIndex
 }
 
 /// Describes the rename of a key.
@@ -176,14 +174,14 @@ impl JournalAction {
     pub fn payload_len(&self, crypto: Option<&Crypto>) -> u64 {
         match self {
             Self::KeyInsert(key) => {
-                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as u64;
+                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0);
                 key.meta.size + (padding * key.meta.chunk_count() as u64)
             }
             Self::KeyRename(_) => 0,
             Self::KeyDelete(_) => 0,
             Self::Batch(_) => 0,
             Self::IndexWrite(w) => {
-                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0) as u64;
+                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0);
                 w.size + padding
             }
         }
