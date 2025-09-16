@@ -166,9 +166,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                     eprintln!("Key '{key}' not found");
                     std::process::exit(1);
                 }
-                Err(err) => {
-                    Err(err)
-                }
+                Err(err) => Err(err),
             }
         }
         Subcommand::Search {
@@ -310,9 +308,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             let total_size: u64 = keys_plus_size.iter().map(|(_, m)| m.size).sum();
             let total_count = keys_plus_size.len();
 
-            eprintln!(
-                "copying {total_count} keys with a total size of {total_size}"
-            );
+            eprintln!("copying {total_count} keys with a total size of {total_size}");
 
             let mut finished_size = 0.0;
             let total_size = total_size as f64;

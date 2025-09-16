@@ -2,7 +2,7 @@ use std::num::NonZeroU32;
 
 use ring::aead;
 
-use crate::{journal::NextEntryOffset, DataOffset, LogFsError};
+use crate::{DataOffset, LogFsError, journal::NextEntryOffset};
 
 #[derive(Clone)]
 pub struct CryptoConfig {
@@ -51,7 +51,7 @@ impl Crypto {
         Self { key: aead_key }
     }
 
-    /// Build the decryption nonce for a [`JournalEntry`] with the given
+    /// Build the decryption nonce for a `JournalEntry` with the given
     /// sequence.
     /// Note that the nonce will have a suffix of 0u32.
     fn build_entry_nonce(sequence: u64) -> aead::Nonce {
@@ -62,7 +62,7 @@ impl Crypto {
     }
 
     /// Build the decryption nonce for a chunk of the raw data of a given
-    /// [`JournalEntry`].
+    /// `JournalEntry`.
     /// The chunk index must start at 1!.
     fn build_data_nonce(sequence: u64, chunk_index: u32) -> Result<aead::Nonce, LogFsError> {
         // if chunk_index < 1 {

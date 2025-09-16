@@ -4,9 +4,9 @@ pub use v2::{Journal2, Superblock};
 use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf, sync::Arc};
 
 use crate::{
+    Batch, KeyLock, LogConfig, LogFsError,
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
-    Batch, KeyLock, LogConfig, LogFsError,
 };
 
 use self::v2::{

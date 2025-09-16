@@ -1,23 +1,23 @@
 use std::{
     io::{BufWriter, Seek, SeekFrom, Write},
-    sync::{atomic::AtomicBool, Arc, RwLock},
+    sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
 use sha2::Digest;
 
 use crate::{
+    KeyLock, LogFsError,
     crypto::Crypto,
     journal::{
-        v2::{data::EntryPointer, ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK},
         SequenceId,
+        v2::{ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, data::EntryPointer},
     },
     state::KeyPointer,
-    KeyLock, LogFsError,
 };
 
 use super::{
+    ENTRY_FIRST_DATA_CHUNK, IndexedSuperBlock, PersistedEntry, State,
     data::{self, ByteCountU64},
-    IndexedSuperBlock, PersistedEntry, State, ENTRY_FIRST_DATA_CHUNK,
 };
 
 #[derive(Clone)]

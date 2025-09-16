@@ -3,12 +3,12 @@ use std::{
     sync::Arc,
 };
 
-use crate::{crypto::Crypto, journal::SequenceId, state::KeyPointer, LogFsError};
+use crate::{LogFsError, crypto::Crypto, journal::SequenceId, state::KeyPointer};
 
 use super::{
+    ENTRY_ACTION_CHUNK, ENTRY_FIRST_DATA_CHUNK, ENTRY_HEADER_CHUNK, IndexedSuperBlock,
+    PersistedEntry,
     data::{self, EntryPointer},
-    IndexedSuperBlock, PersistedEntry, ENTRY_ACTION_CHUNK, ENTRY_FIRST_DATA_CHUNK,
-    ENTRY_HEADER_CHUNK,
 };
 
 pub struct LogReader<'a, R> {

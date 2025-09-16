@@ -1,6 +1,6 @@
 //! Types representing the data written to the log.
 
-use crate::{crypto::Crypto, journal::SequenceId, DataOffset};
+use crate::{DataOffset, crypto::Crypto, journal::SequenceId};
 
 // /// A magic marker used to
 // #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone, Debug)]

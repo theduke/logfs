@@ -4,11 +4,11 @@ use std::{
 };
 
 use crate::{
-    crypto::Crypto, journal::SequenceId, state::KeyPointer, Journal2, LogConfig, LogFsError,
+    Journal2, LogConfig, LogFsError, crypto::Crypto, journal::SequenceId, state::KeyPointer,
 };
 
 use super::{
-    data, determine_file_size, find_entry_header_in_slice, read, read_entry, RepairConfig,
+    RepairConfig, data, determine_file_size, find_entry_header_in_slice, read, read_entry,
 };
 
 pub fn repair(

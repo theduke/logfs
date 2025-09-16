@@ -12,9 +12,9 @@ use std::{
 use sha2::Digest;
 
 use crate::{
+    KeyLock, LogConfig, LogFsError, Path,
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
-    KeyLock, LogConfig, LogFsError, Path,
 };
 
 use self::{
@@ -336,8 +336,8 @@ impl Journal2 {
                 if (meta.len() as u64) < offset {
                     if !is_block_device {
                         return Err(LogFsError::new_internal(
-                        "config specified byte offset, but the specified file is smaller  then the offset",
-                    ));
+                            "config specified byte offset, but the specified file is smaller  then the offset",
+                        ));
                     }
                 }
 
@@ -355,7 +355,9 @@ impl Journal2 {
             )?
         } else {
             if config.offset.is_some() {
-                return Err(LogFsError::new_internal("Specified offset for new file - offset is only valid for existing files that are as large as the given offset"));
+                return Err(LogFsError::new_internal(
+                    "Specified offset for new file - offset is only valid for existing files that are as large as the given offset",
+                ));
             }
 
             let file = std::fs::OpenOptions::new()

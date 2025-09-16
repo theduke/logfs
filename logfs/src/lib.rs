@@ -3,11 +3,11 @@ pub use self::error::LogFsError;
 
 mod journal;
 mod state;
-use journal::{
-    v2::read::{KeyChunkIter, StdKeyReader},
-    SequenceId, Superblock,
-};
 pub use journal::{Journal2, JournalStore};
+use journal::{
+    SequenceId, Superblock,
+    v2::read::{KeyChunkIter, StdKeyReader},
+};
 
 mod crypto;
 pub use crypto::CryptoConfig;
