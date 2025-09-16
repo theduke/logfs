@@ -137,7 +137,7 @@ impl Options {
 fn pretty_value(value: &[u8]) -> String {
     match std::str::from_utf8(value) {
         Ok(s) => s.to_string(),
-        Err(_) => format!("{:x?}", value),
+        Err(_) => format!("{value:x?}"),
     }
 }
 
@@ -149,7 +149,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             let mut lock = stdout.lock();
 
             for path in db.paths_offset(offset.unwrap_or_default(), max.unwrap_or(1000))? {
-                write!(&mut lock, "{}\n", path).unwrap();
+                writeln!(&mut lock, "{path}").unwrap();
             }
 
             Ok(())
@@ -163,11 +163,11 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                     Ok(())
                 }
                 Ok(None) => {
-                    eprintln!("Key '{}' not found", key);
+                    eprintln!("Key '{key}' not found");
                     std::process::exit(1);
                 }
                 Err(err) => {
-                    return Err(err);
+                    Err(err)
                 }
             }
         }
@@ -192,7 +192,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                         eprintln!("Deleted: {key}");
                     }
                     if keys_only {
-                        print!("{key}\n");
+                        println!("{key}");
                     } else {
                         eprintln!("Match {key}:\n{s}\n\n");
                     }
@@ -224,9 +224,9 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 for key in keys {
                     if db.get(&key).is_ok() {
                         db.remove(&key)?;
-                        eprintln!("Key '{}' deleted", key);
+                        eprintln!("Key '{key}' deleted");
                     } else {
-                        eprintln!("Error: Key '{}' does not exist", key);
+                        eprintln!("Error: Key '{key}' does not exist");
                         std::process::exit(1);
                     }
                 }
@@ -311,8 +311,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             let total_count = keys_plus_size.len();
 
             eprintln!(
-                "copying {} keys with a total size of {}",
-                total_count, total_size
+                "copying {total_count} keys with a total size of {total_size}"
             );
 
             let mut finished_size = 0.0;
@@ -383,6 +382,6 @@ fn main() -> Result<(), logfs::LogFsError> {
     if version == 2 {
         run::<logfs::Journal2>(opt)
     } else {
-        panic!("Unsupported version {}", version);
+        panic!("Unsupported version {version}");
     }
 }
