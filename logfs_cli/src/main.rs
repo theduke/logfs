@@ -353,13 +353,13 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             for key in db.paths_prefix(&key_prefix)? {
                 let content = db.get(&key)?.unwrap();
 
-                if let Ok(s) = String::from_utf8(content) {
-                    if s.contains(&match_text) {
-                        let new = s.replace(&match_text, &replacement);
-                        eprintln!("Replacing in key '{key}'");
-                        db.insert(key, new.into_bytes())?;
-                        count += 1;
-                    }
+                if let Ok(s) = String::from_utf8(content)
+                    && s.contains(&match_text)
+                {
+                    let new = s.replace(&match_text, &replacement);
+                    eprintln!("Replacing in key '{key}'");
+                    db.insert(key, new.into_bytes())?;
+                    count += 1;
                 }
             }
 

@@ -299,13 +299,13 @@ impl Journal2 {
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError> {
-        if let Some(parent) = path.parent() {
-            if !parent.is_dir() {
-                if config.allow_create {
-                    std::fs::create_dir_all(parent)?;
-                } else {
-                    return Err(LogFsError::new_internal("Parent directory does not exist"));
-                }
+        if let Some(parent) = path.parent()
+            && !parent.is_dir()
+        {
+            if config.allow_create {
+                std::fs::create_dir_all(parent)?;
+            } else {
+                return Err(LogFsError::new_internal("Parent directory does not exist"));
             }
         }
 
