@@ -395,10 +395,10 @@ impl<J: JournalStore> LogFs<J> {
         }
         let path = path.as_ref();
 
-        let mut state = self.inner.state.write().unwrap();
-        if let Some(_pointer) = state.remove_key(path) {
-            let _lock = self.acquire_key_lock();
+        let _lock = self.acquire_key_lock();
 
+        let mut state = self.inner.state.write().unwrap();
+        if state.remove_key(path).is_some() {
             self.inner.journal.write_remove(vec![path.to_string()])?;
 
             self.write_index_if_required(&mut state)?;
@@ -413,23 +413,26 @@ impl<J: JournalStore> LogFs<J> {
             return Err(LogFsError::ReadOnly);
         }
         let prefix = prefix.as_ref();
-        let state = self.inner.state.write().unwrap();
-        let paths = state.paths_prefix(prefix);
+        let _lock = self.acquire_key_lock();
+        let paths = {
+            let state = self.inner.state.read().unwrap();
+            state.paths_prefix(prefix)
+        };
 
         tracing::trace!(%prefix, key_count=%paths.len(), "deleting keys with prefix");
 
-        if !paths.is_empty() {
-            let _lock = self.acquire_key_lock();
-            std::mem::drop(state);
-            self.inner.journal.write_remove(paths.clone())?;
-
-            let mut state = self.inner.state.write().unwrap();
-            for path in paths {
-                state.remove_key(&path);
-            }
-
-            self.write_index_if_required(&mut state)?;
+        if paths.is_empty() {
+            return Ok(());
         }
+
+        self.inner.journal.write_remove(paths.clone())?;
+
+        let mut state = self.inner.state.write().unwrap();
+        for path in &paths {
+            state.remove_key(path);
+        }
+
+        self.write_index_if_required(&mut state)?;
 
         Ok(())
     }
