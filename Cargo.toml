@@ -6,6 +6,8 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.0"
+
 authors = ["Christoph Herzog <chris@theduke.at>"]
 readme = "README.md"
 keywords = [

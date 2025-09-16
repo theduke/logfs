@@ -1,14 +1,18 @@
 [package]
 name = "logfs-cli"
-version = "0.1.0"
+
+version.workspace = true
+description = "CLI for logfs - a simple append-only log based filesystem with encryption and compression"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+readme.workspace = true
 
 [dependencies]
+logfs = { path = "../logfs", version = "0.1.0" }
+
 clap = { version = "4.0.2", features = ["derive", "env", "help"] }
-logfs = { path = "../logfs" }
 tracing-subscriber = { version = "0.3.15", features = ["fmt", "env-filter"] }
 zeroize = "1.5.7"
