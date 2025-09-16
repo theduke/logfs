@@ -301,7 +301,11 @@ impl Journal2 {
     ) -> Result<Self, LogFsError> {
         if let Some(parent) = path.parent() {
             if !parent.is_dir() {
-                std::fs::create_dir_all(parent)?;
+                if config.allow_create {
+                    std::fs::create_dir_all(parent)?;
+                } else {
+                    return Err(LogFsError::new_internal("Parent directory does not exist"));
+                }
             }
         }
 
@@ -318,13 +322,16 @@ impl Journal2 {
             }
 
             let is_block_device = {
-                #[cfg(target_os = "linux")]
+                // TODO: support other OSes?
+                #[cfg(target_family = "unix")]
                 {
                     use std::os::unix::fs::FileTypeExt;
                     meta.file_type().is_block_device()
                 }
-                #[cfg(not(target_os = "linux"))]
-                false
+                #[cfg(not(target_family = "unix"))]
+                {
+                    false
+                }
             };
 
             let mut file = std::fs::OpenOptions::new()
@@ -342,15 +349,31 @@ impl Journal2 {
                 file.seek(io::SeekFrom::Start(offset))?;
             }
 
-            let mut state = tree.write().unwrap();
+            if Some(meta.len()) == config.offset && !is_block_device {
+                // File is exactly at the offset - treat as new file.
+                if !config.allow_create {
+                    return Err(LogFsError::new_internal(
+                        "File is empty at the specified offset - but allow_create is false",
+                    ));
+                }
 
-            Self::open_existing(
-                file,
-                &mut state,
-                &crypto,
-                config.offset.unwrap_or_default(),
-                &tainted,
-            )?
+                LogWriter::create_new(
+                    crypto.clone(),
+                    tainted.clone(),
+                    file,
+                    config.offset.unwrap_or_default(),
+                )?
+            } else {
+                let mut state = tree.write().unwrap();
+
+                Self::open_existing(
+                    file,
+                    &mut state,
+                    &crypto,
+                    config.offset.unwrap_or_default(),
+                    &tainted,
+                )?
+            }
         } else {
             if config.offset.is_some() {
                 return Err(LogFsError::new_internal(
