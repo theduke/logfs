@@ -199,7 +199,7 @@ impl JournalAction {
 }
 
 bitflags::bitflags! {
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
     #[repr(transparent)]
     pub struct JournalEntryHeaderFlags: u32 {
         const INCOMPLETE = 0b00000001;
@@ -253,7 +253,7 @@ pub struct EntryPointer {
 }
 
 bitflags::bitflags! {
-#[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
     pub struct SuperblockFlags : u32 {
 
     }
