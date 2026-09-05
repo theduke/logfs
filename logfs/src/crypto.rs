@@ -118,8 +118,18 @@ impl Crypto {
         chunk_index: u32,
         data: &mut Vec<u8>,
     ) -> Result<(), LogFsError> {
+        self.encrypt_data_with_aad(sequence, chunk_index, &[], data)
+    }
+
+    pub(crate) fn encrypt_data_with_aad(
+        &self,
+        sequence: u64,
+        chunk_index: u32,
+        aad: &[u8],
+        data: &mut Vec<u8>,
+    ) -> Result<(), LogFsError> {
         let data_nonce = Self::build_data_nonce(sequence, chunk_index)?;
-        let aad = aead::Aad::from(&[]);
+        let aad = aead::Aad::from(aad);
         self.key
             .seal_in_place_append_tag(data_nonce, aad, data)
             .map_err(|_| LogFsError::new_internal("Could not encrypt journal entry"))
@@ -131,10 +141,20 @@ impl Crypto {
         chunk_index: u32,
         data: &'a mut [u8],
     ) -> Result<&'a [u8], LogFsError> {
+        self.decrypt_data_ref_with_aad(sequence, chunk_index, &[], data)
+    }
+
+    pub(crate) fn decrypt_data_ref_with_aad<'a>(
+        &self,
+        sequence: u64,
+        chunk_index: u32,
+        aad: &[u8],
+        data: &'a mut [u8],
+    ) -> Result<&'a [u8], LogFsError> {
         let nonce = Self::build_data_nonce(sequence, chunk_index)?;
         let slice = self
             .key
-            .open_in_place(nonce, aead::Aad::from(&[]), data)
+            .open_in_place(nonce, aead::Aad::from(aad), data)
             .map_err(|_| LogFsError::new_internal("Could not decrypt data"))?;
         Ok(slice)
     }
@@ -143,15 +163,53 @@ impl Crypto {
         &self,
         sequence: u64,
         chunk_index: u32,
+        data: Vec<u8>,
+    ) -> Result<Vec<u8>, LogFsError> {
+        self.decrypt_data_with_aad(sequence, chunk_index, &[], data)
+    }
+
+    pub(crate) fn decrypt_data_with_aad(
+        &self,
+        sequence: u64,
+        chunk_index: u32,
+        aad: &[u8],
         mut data: Vec<u8>,
     ) -> Result<Vec<u8>, LogFsError> {
         let full_length = data.len();
-        let nonce = Self::build_data_nonce(sequence, chunk_index)?;
-        self.key
-            .open_in_place(nonce, aead::Aad::from(&[]), data.as_mut_slice())
-            .map_err(|_| LogFsError::new_internal("Could not decrypt data"))?;
+        self.decrypt_data_ref_with_aad(sequence, chunk_index, aad, data.as_mut_slice())?;
         // Need to truncate data to actual length without the tag.
         data.truncate(full_length - self.extra_payload_len() as usize);
         Ok(data)
+    }
+
+    pub(crate) fn encrypt_with_nonce(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        data: &mut Vec<u8>,
+    ) -> Result<(), LogFsError> {
+        self.key
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(aad),
+                data,
+            )
+            .map_err(|_| LogFsError::new_internal("Could not encrypt v3 root"))
+    }
+
+    pub(crate) fn decrypt_with_nonce<'a>(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        data: &'a mut [u8],
+    ) -> Result<&'a [u8], LogFsError> {
+        self.key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(aad),
+                data,
+            )
+            .map(|data| &*data)
+            .map_err(|_| LogFsError::new_internal("Could not decrypt v3 root"))
     }
 }

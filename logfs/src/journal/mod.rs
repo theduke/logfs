@@ -52,7 +52,8 @@ impl SequenceId {
         self.0
             .get()
             .checked_sub(1)
-            .map(|x| Self(NonZeroU64::new(x).unwrap()))
+            .and_then(NonZeroU64::new)
+            .map(Self)
             .ok_or_else(|| {
                 // TODO: use special error variant.
                 LogFsError::new_internal(
@@ -115,10 +116,34 @@ pub trait JournalStore {
 
     fn read_data(&self, pointer: &KeyPointer) -> Result<Vec<u8>, LogFsError>;
 
+    /// Read a value while requesting all available integrity verification.
+    /// Returns whether a whole-value hash was available and checked.
+    fn verify_data(&self, pointer: &KeyPointer) -> Result<bool, LogFsError> {
+        self.read_data(pointer)?;
+        Ok(false)
+    }
+
     fn reader(&self, pointer: &KeyPointer) -> Result<StdKeyReader, LogFsError>;
 
     fn read_chunks(&self, pointer: &KeyPointer) -> Result<KeyChunkIter, LogFsError>;
 
     fn size_log(&self) -> Result<u64, LogFsError>;
     fn supberlock(&self) -> Result<Superblock, LogFsError>;
+    /// Flush buffered bytes to the operating system. This is not a power-loss
+    /// durability guarantee; use `sync` for that boundary.
+    fn flush(&self) -> Result<(), LogFsError> {
+        Ok(())
+    }
+    /// Establish an explicit durable boundary for all previously accepted
+    /// mutations.
+    fn sync(&self) -> Result<(), LogFsError> {
+        self.flush()
+    }
+    /// Enable ordered durable publication for subsequent mutations. The
+    /// default implementation keeps compatibility for custom stores.
+    fn set_durable(&self, _durable: bool) -> Result<(), LogFsError> {
+        Err(LogFsError::new_internal(
+            "This journal store does not support durable commit mode",
+        ))
+    }
 }

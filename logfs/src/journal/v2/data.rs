@@ -76,7 +76,16 @@ impl KeyMeta {
 }
 
 pub fn compute_chunk_count(data_size: ByteCountU64, chunk_size: ByteCountU32) -> ChunkIndex {
-    data_size.div_ceil(chunk_size as u64) as ChunkIndex
+    if data_size == 0 {
+        1
+    } else if chunk_size == 0 {
+        0
+    } else {
+        data_size
+            .div_ceil(chunk_size as u64)
+            .try_into()
+            .unwrap_or(ChunkIndex::MAX)
+    }
 }
 
 /// Describes the rename of a key.
@@ -127,6 +136,22 @@ pub struct KeyIndex {
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct KeyIndexEntryV3 {
+    pub key: KeyPath,
+    pub sequence_id: SequenceId,
+    pub crypto_domain: Option<u64>,
+    pub file_offset: DataOffset,
+    pub size: ByteCountU64,
+    pub chunk_size: Option<ByteCountU32>,
+    pub hash: Option<Sha256Hash>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
+pub struct KeyIndexV3 {
+    pub keys: Vec<KeyIndexEntryV3>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub enum CompressionFormat {
     Brotli,
 }
@@ -139,12 +164,6 @@ pub struct ActionIndexWrite {
     pub hash: Sha256Hash,
     /// Optional compression method.
     pub compression: Option<CompressionFormat>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub enum BatchItem {
-    Rename(KeyRename),
-    Delete(ActionKeyDelete),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -168,6 +187,9 @@ pub enum JournalAction {
     IndexWrite(ActionIndexWrite),
     /// A batch of multiple key renames and deletes.
     Batch(ActionBatch),
+    /// V3 full snapshot including the integrity and nonce-domain metadata
+    /// omitted by legacy v2 checkpoints.
+    IndexWriteV3(ActionIndexWrite),
 }
 
 impl JournalAction {
@@ -175,14 +197,20 @@ impl JournalAction {
         match self {
             Self::KeyInsert(key) => {
                 let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0);
-                key.meta.size + (padding * key.meta.chunk_count() as u64)
+                key.meta
+                    .size
+                    .saturating_add(padding.saturating_mul(key.meta.chunk_count() as u64))
             }
             Self::KeyRename(_) => 0,
             Self::KeyDelete(_) => 0,
             Self::Batch(_) => 0,
             Self::IndexWrite(w) => {
                 let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0);
-                w.size + padding
+                w.size.saturating_add(padding)
+            }
+            Self::IndexWriteV3(w) => {
+                let padding = crypto.map(|c| c.extra_payload_len()).unwrap_or(0);
+                w.size.saturating_add(padding)
             }
         }
     }
@@ -192,7 +220,7 @@ impl JournalAction {
     /// [`IndexWrite`]: JournalAction::IndexWrite
     #[must_use]
     pub fn is_index_write(&self) -> bool {
-        matches!(self, Self::IndexWrite(..))
+        matches!(self, Self::IndexWrite(..) | Self::IndexWriteV3(..))
     }
 }
 
@@ -209,7 +237,7 @@ bitflags::bitflags! {
 /// This is serialized separately from the JournalAction.
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct JournalEntryHeader {
-    /// The global file offset.
+    /// Offset relative to the start of the configured log region.
     /// Included for consistency checks.
     pub offset: Offset,
 
@@ -262,6 +290,8 @@ bitflags::bitflags! {
 pub enum LogFormatVersion {
     V1 = 1,
     V2 = 2,
+    /// Corrected root envelope and crash-safe encrypted sequence reservation.
+    V3 = 3,
 }
 
 /// A superblock contains metadata about the log.

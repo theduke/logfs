@@ -268,15 +268,35 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             new_offset,
         } => {
             eprintln!("Opening old database...");
-            let old_db = logfs::LogFs::<J>::open(opt.build_config())?;
+            let mut source_config = opt.build_config();
+            source_config.readonly = true;
+            let old_db = logfs::LogFs::<J>::open(source_config)?;
+            let source_scrub = old_db.scrub()?;
+            if source_scrub.keys_unverifiable != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "source contains {} legacy values without recoverable whole-value hashes",
+                        source_scrub.keys_unverifiable
+                    ),
+                )
+                .into());
+            }
 
             eprintln!("Creating new database...");
 
             let sequence = old_db.superblock()?.active_sequence;
 
+            let new_path: std::path::PathBuf = new_path.into();
+            if new_path.exists() {
+                return Err(logfs::LogFsError::from(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "compact destination already exists",
+                )));
+            }
             let new_config = LogConfig {
                 readonly: false,
-                path: new_path.into(),
+                path: new_path,
                 raw_mode: false,
                 offset: new_offset,
                 allow_create: true,
@@ -293,45 +313,84 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 full_index_write_interval: sequence,
             };
 
-            let new_db =
-                logfs::LogFs::<J>::open(new_config).expect("Could not open new database...");
-            let all_keys = old_db.paths_range(..).expect("Could not obtain old keys");
+            let new_db = logfs::LogFs::<J>::open_durable(new_config.clone())?;
+            let all_keys = old_db.paths_range(..)?;
 
             let keys_plus_size: Vec<(String, KeyMeta)> = all_keys
                 .into_iter()
                 .map(|key| {
-                    let meta = old_db.get_meta(&key).unwrap().unwrap();
-                    (key, meta)
+                    old_db.get_meta(&key).and_then(|meta| {
+                        meta.map(|meta| (key.clone(), meta)).ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!("source key disappeared during compact: {key}"),
+                            )
+                            .into()
+                        })
+                    })
                 })
-                .collect();
+                .collect::<Result<_, logfs::LogFsError>>()?;
 
-            let total_size: u64 = keys_plus_size.iter().map(|(_, m)| m.size).sum();
+            let total_size_bytes: u64 = keys_plus_size.iter().map(|(_, m)| m.size).sum();
             let total_count = keys_plus_size.len();
 
-            eprintln!("copying {total_count} keys with a total size of {total_size}");
+            eprintln!("copying {total_count} keys with a total size of {total_size_bytes}");
 
             let mut finished_size = 0.0;
-            let total_size = total_size as f64;
+            let total_size = total_size_bytes as f64;
             for (index, (key, meta)) in keys_plus_size.into_iter().enumerate() {
                 eprintln!(
                     "count: {}/{} total_size_pct: {} - {}",
                     index + 1,
                     total_count,
-                    ((finished_size / total_size) * 10000.0).round() / 100.0,
+                    if total_size == 0.0 {
+                        100.0
+                    } else {
+                        ((finished_size / total_size) * 10000.0).round() / 100.0
+                    },
                     key
                 );
 
                 // Keys smaller than 100mb: just load them into memory
                 if meta.size < 100_000_000 {
-                    let value = old_db.get(&key).unwrap().unwrap();
-                    new_db.insert(key, value).unwrap();
+                    let value = old_db.get(&key)?.ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("source key disappeared during compact: {key}"),
+                        )
+                    })?;
+                    new_db.insert(key, value)?;
                 } else {
-                    let mut reader = old_db.get_reader(&key).unwrap();
-                    let mut writer = new_db.insert_writer(&key).unwrap();
-                    std::io::copy(&mut reader, &mut writer).unwrap();
+                    let mut reader = old_db.get_reader(&key)?;
+                    let mut writer = new_db.insert_writer(&key)?;
+                    if let Err(error) = std::io::copy(&mut reader, &mut writer) {
+                        writer.abort()?;
+                        return Err(error.into());
+                    }
+                    writer.finish()?;
                 }
 
                 finished_size += meta.size as f64;
+            }
+
+            new_db.checkpoint()?;
+            new_db.sync()?;
+            drop(new_db);
+            let reopened = logfs::LogFs::<J>::open(LogConfig {
+                allow_create: false,
+                readonly: true,
+                ..new_config
+            })?;
+            let report = reopened.scrub()?;
+            if report.keys_verified as usize != total_count
+                || report.logical_bytes_verified != total_size_bytes
+                || report.keys_unverifiable != 0
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "compact verification did not match source counts",
+                )
+                .into());
             }
 
             eprintln!("Complete!");
