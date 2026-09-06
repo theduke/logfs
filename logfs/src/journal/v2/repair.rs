@@ -27,9 +27,13 @@ pub fn repair(
     })?;
     let file_size = determine_file_size(&mut f)?;
     let probe_offset = log_config.offset.unwrap_or_default();
+    let valid_legacy = read::LogReader::new_start(f.try_clone()?, probe_offset, crypto.as_deref())
+        .read_superblocks()
+        .is_ok_and(|root| matches!(root.format, super::RootFormat::LegacyV2));
     let mut v3_identity = None;
+    let mut derived_crypto = false;
     let mut is_v3 = false;
-    for index in 0..V3_ROOT_COUNT {
+    for index in 0..if valid_legacy { 0 } else { V3_ROOT_COUNT } {
         let offset = probe_offset
             .checked_add(v3_alignment_padding(probe_offset))
             .and_then(|offset| offset.checked_add(index.saturating_mul(V3_ROOT_SLOT_SIZE)))
@@ -42,6 +46,15 @@ pub fn repair(
         f.read_exact(&mut root)?;
         if root[..8] == V3_ROOT_MAGIC || root[V3_ROOT_MAGIC_COPY_OFFSET..] == V3_ROOT_MAGIC {
             is_v3 = true;
+            let root_derived = root[16]
+                & (super::V3_ROOT_FLAG_ENCRYPTED | super::V3_ROOT_FLAG_DERIVED_KEYS)
+                == (super::V3_ROOT_FLAG_ENCRYPTED | super::V3_ROOT_FLAG_DERIVED_KEYS);
+            if v3_identity.is_some() && root_derived != derived_crypto {
+                return Err(LogFsError::new_internal(
+                    "Repair found conflicting v3 crypto suites",
+                ));
+            }
+            derived_crypto = root_derived;
             let identity: [u8; 16] = root[28..44]
                 .try_into()
                 .map_err(|_| LogFsError::new_internal("Truncated v3 identity"))?;
@@ -63,6 +76,16 @@ pub fn repair(
             LogFsError::new_internal("V3 repair could not recover the file identity")
         })
     };
+    let derived_v3_crypto = if is_v3 && derived_crypto {
+        Some(
+            crypto
+                .as_ref()
+                .ok_or_else(|| LogFsError::new_internal("Encrypted v3 repair requires a key"))?
+                .v3_crypto(required_v3_identity()?),
+        )
+    } else {
+        None
+    };
 
     let mut file_offset = config.skip_bytes.unwrap_or_default();
     if file_offset > file_size {
@@ -73,14 +96,6 @@ pub fn repair(
 
     f.seek(SeekFrom::Start(file_offset))?;
     let mut reader = BufReader::new(f);
-
-    // let _superblock = match reader.read_superblocks() {
-    //     Ok(s) => Some(s),
-    //     Err(error) => {
-    //         tracing::warn!(?error, "could not read superblocks");
-    //         None
-    //     }
-    // };
 
     let sequence = config.start_sequence.unwrap_or(SequenceId::from_u64(1));
 
@@ -106,6 +121,7 @@ pub fn repair(
         if is_v3 {
             if let Some((header, buffer_offset, domain)) = find_v3_entry_header_in_slice(
                 crypto.as_deref(),
+                derived_v3_crypto.as_ref(),
                 required_v3_identity()?,
                 sequence,
                 &buffer,
@@ -165,6 +181,7 @@ pub fn repair(
                 &mut reader,
                 &mut buffer,
                 crypto_ref,
+                derived_v3_crypto.as_ref(),
                 required_v3_identity()?,
                 sequence,
             )
@@ -266,6 +283,7 @@ pub fn repair(
                         hash: Some(meta.hash.0),
                         crypto_domain,
                         log_identity: v3_identity,
+                        derived_crypto: derived_v3_crypto.is_some(),
                     },
                 );
             }
@@ -319,11 +337,6 @@ pub fn repair(
             return Ok(());
         }
     };
-    if target_path.exists() {
-        return Err(LogFsError::new_internal(
-            "Recovery destination already exists; refusing to overwrite it",
-        ));
-    }
     if std::fs::canonicalize(&log_config.path).ok()
         == target_path.parent().and_then(|parent| {
             std::fs::canonicalize(parent)
@@ -345,7 +358,7 @@ pub fn repair(
         readonly: false,
         ..log_config.clone()
     };
-    let j = Journal2::open(
+    let j = Journal2::create_new_exclusive(
         target_path.clone(),
         new_state.clone(),
         crypto.clone(),
@@ -421,111 +434,6 @@ pub fn repair(
     }
 
     tracing::info!("recovery complete");
-
-    // match reader.read_superblocks() {
-    //     Ok(b) => {
-    //         tracing::info!(superblock=?b, "found superblock");
-    //     }
-    //     Err(error) => {
-    //         tracing::warn!(?error, "could not read superblocks");
-    //     }
-    // }
-
-    // reader.reader.seek(SeekFrom::Start(0))?;
-    // reader.offset = 0;
-    // // reader.skip_superblocks()?;
-
-    // tracing::info!("searching for log entries");
-
-    // let mut entry = None;
-    // let mut count = 0;
-
-    // let mut offset = reader.reader.stream_position()?;
-
-    // let sequence = config.start_sequence.unwrap_or(SequenceId::from_u64(1));
-    // tracing::info!(target_sequence=?sequence, "Trying to find start entry");
-    // reader.next_sequence = sequence;
-    // loop {
-    //     reader.reader.seek(SeekFrom::Start(offset))?;
-    //     reader.offset = offset;
-
-    //     match reader.next_entry() {
-    //         Ok(e) => {
-    //             if e.entry.header.sequence_id == sequence {
-    //                 entry = Some(e);
-    //                 tracing::info!(?sequence, "Found desired start entry");
-    //                 break;
-    //             } else {
-    //                 tracing::warn!(entry=?e, "Found entry, but not with the desired sequence");
-    //             }
-    //         }
-    //         Err(error) => {
-    //             if !error.to_string().contains("not decrypt") {
-    //                 tracing::trace!(%error, "could not read entry");
-    //             }
-    //         }
-    //     }
-    //     offset += 1;
-
-    //     if offset % 10000 == 0 {
-    //         tracing::trace!(
-    //             target_sequence=?sequence,
-    //             current_offset=%offset,
-    //             "still trying to find start entry"
-    //         );
-    //     }
-    // }
-
-    // loop {
-    //     match reader.next_entry() {
-    //         Ok(e) => {
-    //             entry = Some(e);
-    //             count += 1;
-    //         }
-    //         Err(error) => {
-    //             tracing::warn!(?error, count = count + 1, "Could not read entry");
-    //             break;
-    //         }
-    //     }
-    // }
-
-    // let last_entry = entry
-    //     .ok_or_else(|| LogFsError::new_internal("Could not find any restorable entries"))?;
-
-    // tracing::info!(
-    //     entry_count=count,
-    //     sequence_id=?last_entry.entry.header.sequence_id,
-    //     "Found entries that can be restored"
-    // );
-
-    // if config.dry_run {
-    //     return Ok(());
-    // }
-
-    // let tainted = TaintedFlag::new();
-
-    // let reader_pos = reader.reader.stream_position()?;
-    // let mut file = reader.reader.into_inner();
-    // file.seek(SeekFrom::Start(reader_pos))?;
-
-    // let superblock = IndexedSuperBlock {
-    //     block: data::Superblock {
-    //         format_version: data::LogFormatVersion::V2,
-    //         flags: data::SuperblockFlags::empty(),
-    //         tail_offset: reader_pos,
-    //         last_index_entry: None,
-    //         active_sequence: last_entry.entry.header.sequence_id.as_u64(),
-    //     },
-    //     index: 1,
-    // };
-    // let mut writer = LogWriter::open(crypto.clone(), tainted.clone(), file, superblock)?;
-    // writer.write_next_superblock()?;
-
-    // tracing::info!(
-    //     entry_count=count,
-    //     sequence_id=?last_entry.entry.header.sequence_id,
-    //     "Restored superblock"
-    // );
 
     Ok(())
 }

@@ -24,6 +24,8 @@ pub struct KeyPointer {
     /// V3 file identity used as AEAD associated data. Legacy entries leave it
     /// unset.
     pub(crate) log_identity: Option<[u8; 16]>,
+    /// Whether this v3 entry uses the corrected per-file/per-purpose key schedule.
+    pub(crate) derived_crypto: bool,
 }
 
 /// Runtime state of the db.

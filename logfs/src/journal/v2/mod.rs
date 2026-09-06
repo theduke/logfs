@@ -34,22 +34,7 @@ struct PersistedEntry {
     file_data_offset: data::Offset,
     crypto_domain: Option<u64>,
     log_identity: Option<[u8; 16]>,
-}
-
-impl PersistedEntry {
-    // fn to_key_pointer(&self, crypto: Option<&Crypto>) -> KeyPointer {
-    //     KeyPointer {
-    //         sequence_id: self.entry.header.sequence_id.as_u64(),
-    //         file_offset: self.file_data_offset,
-    //         size: self.entry.action.payload_len(crypto),
-    //         chunk_size: match &self.entry.action {
-    //             data::JournalAction::KeyInsert(ins) => ins.meta.chunk_size,
-    //             data::JournalAction::KeyRename(_) => None,
-    //             data::JournalAction::KeyDelete(_) => None,
-    //             data::JournalAction::IndexWrite(_) => None,
-    //         },
-    //     }
-    // }
+    derived_crypto: bool,
 }
 
 pub struct Journal2 {
@@ -196,6 +181,7 @@ fn find_entry_header_in_slice(
 
 fn find_v3_entry_header_in_slice(
     crypto: Option<&Crypto>,
+    derived_crypto: Option<&crate::crypto::V3Crypto>,
     identity: [u8; 16],
     sequence: SequenceId,
     bytes: &[u8],
@@ -214,7 +200,12 @@ fn find_v3_entry_header_in_slice(
         let domain = u64::from_le_bytes(bytes[index..index + 8].try_into().ok()?);
         let mut header_bytes = bytes[index + 8..index + candidate_len].to_vec();
         let aad = v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
-        let clear = if let Some(crypto) = crypto {
+        let clear = if let Some(crypto) = derived_crypto {
+            match crypto.decrypt_entry_ref(domain, ENTRY_HEADER_CHUNK, &aad, &mut header_bytes) {
+                Ok(clear) => clear,
+                Err(_) => continue,
+            }
+        } else if let Some(crypto) = crypto {
             match crypto.decrypt_data_ref_with_aad(
                 domain,
                 ENTRY_HEADER_CHUNK,
@@ -342,6 +333,7 @@ fn read_v3_entry(
     reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
     crypto: Option<&Crypto>,
+    derived_crypto: Option<&crate::crypto::V3Crypto>,
     identity: [u8; 16],
     sequence: SequenceId,
 ) -> Result<(data::JournalEntry, u64), LogFsError> {
@@ -355,7 +347,9 @@ fn read_v3_entry(
     buffer.resize(header_size, 0);
     reader.read_exact(buffer)?;
     let header_aad = v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
-    let header_bytes = if let Some(crypto) = crypto {
+    let header_bytes = if let Some(crypto) = derived_crypto {
+        crypto.decrypt_entry_ref(domain, ENTRY_HEADER_CHUNK, &header_aad, buffer)?
+    } else if let Some(crypto) = crypto {
         crypto.decrypt_data_ref_with_aad(domain, ENTRY_HEADER_CHUNK, &header_aad, buffer)?
     } else {
         verify_plain_metadata_checksum(buffer, &header_aad)?
@@ -366,7 +360,15 @@ fn read_v3_entry(
             "Recovered v3 entry has an unexpected sequence",
         ));
     }
-    let action = read_entry_action_with_domain(reader, buffer, crypto, &header, domain, identity)?;
+    let action = read_entry_action_with_domain(
+        reader,
+        buffer,
+        crypto,
+        derived_crypto,
+        &header,
+        domain,
+        identity,
+    )?;
     Ok((data::JournalEntry { header, action }, domain))
 }
 
@@ -374,6 +376,7 @@ fn read_entry_action_with_domain(
     reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
     crypto: Option<&Crypto>,
+    derived_crypto: Option<&crate::crypto::V3Crypto>,
     header: &data::JournalEntryHeader,
     domain: u64,
     identity: [u8; 16],
@@ -387,7 +390,9 @@ fn read_entry_action_with_domain(
     buffer.resize(action_size, 0);
     reader.read_exact(buffer)?;
     let aad = v3_aad(identity, domain, ENTRY_ACTION_CHUNK);
-    let bytes = if let Some(crypto) = crypto {
+    let bytes = if let Some(crypto) = derived_crypto {
+        crypto.decrypt_entry_ref(domain, ENTRY_ACTION_CHUNK, &aad, buffer)?
+    } else if let Some(crypto) = crypto {
         crypto.decrypt_data_ref_with_aad(domain, ENTRY_ACTION_CHUNK, &aad, buffer)?
     } else {
         verify_plain_metadata_checksum(buffer, &aad)?
@@ -581,6 +586,7 @@ fn restore_index<R: io::Read + io::Seek>(
                         hash: None,
                         crypto_domain: None,
                         log_identity: None,
+                        derived_crypto: false,
                     });
                 }
             }
@@ -628,6 +634,7 @@ fn restore_index<R: io::Read + io::Seek>(
                                 hash: item.hash.map(|hash| hash.0),
                                 crypto_domain: item.crypto_domain,
                                 log_identity: reader.v3_identity(),
+                                derived_crypto: reader.uses_derived_crypto(),
                             },
                         )
                         .is_some()
@@ -661,6 +668,71 @@ impl Journal2 {
         Self::open_with_region(path, tree, crypto, config, None)
     }
 
+    pub(crate) fn create_new_exclusive(
+        path: std::path::PathBuf,
+        _tree: SharedTree,
+        crypto: Option<Arc<Crypto>>,
+        config: &LogConfig,
+    ) -> Result<Self, LogFsError> {
+        if config.readonly {
+            return Err(LogFsError::ReadOnly);
+        }
+        if config.default_chunk_size == 0 {
+            return Err(LogFsError::new_internal(
+                "default_chunk_size must be greater than zero",
+            ));
+        }
+        if let Some(parent) = path.parent()
+            && !parent.is_dir()
+        {
+            if config.allow_create {
+                std::fs::create_dir_all(parent)?;
+            } else {
+                return Err(LogFsError::new_internal("Parent directory does not exist"));
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+            LogFsError::new_internal(format!("Could not acquire exclusive log lock: {error}"))
+        })?;
+        if let Some(offset) = config.offset {
+            file.set_len(offset)?;
+            file.seek(io::SeekFrom::Start(offset))?;
+        }
+        let tainted = write::TaintedFlag::new();
+        let durable = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut writer = LogWriter::create_new(
+            crypto.clone(),
+            tainted.clone(),
+            file,
+            config.offset.unwrap_or_default(),
+            durable.clone(),
+            None,
+        )?;
+        writer.begin_write_session()?;
+        let backing = Arc::new(read::BackingFile::new(writer.backing_clone()?));
+        Ok(Self {
+            state: Arc::new(State {
+                writer: std::sync::Mutex::new(WriterState::Available(Some(Box::new(writer)))),
+                writer_condvar: std::sync::Condvar::new(),
+                tainted: tainted.clone(),
+            }),
+            _tainted: tainted,
+            crypto,
+            path,
+            default_chunk_size: config.default_chunk_size,
+            readonly: false,
+            checkpoint_interval: config.full_index_write_interval,
+            backing,
+            durable,
+            verify_reads: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
     pub(crate) fn open_with_region(
         path: std::path::PathBuf,
         tree: SharedTree,
@@ -683,35 +755,17 @@ impl Journal2 {
             }
         }
 
-        let meta_opt = match path.metadata() {
-            Ok(m) => Some(m),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => return Err(err.into()),
+        let mut existing_options = std::fs::OpenOptions::new();
+        existing_options.read(true).write(!config.readonly);
+        let existing_file = match existing_options.open(&path) {
+            Ok(file) => Some(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
         };
 
         let tainted = write::TaintedFlag::new();
         let durable = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut writer = if let Some(meta) = meta_opt {
-            if path.is_dir() {
-                return Err(LogFsError::new_internal("Database path is a directory"));
-            }
-
-            let is_block_device = {
-                // TODO: support other OSes?
-                #[cfg(target_family = "unix")]
-                {
-                    use std::os::unix::fs::FileTypeExt;
-                    meta.file_type().is_block_device()
-                }
-                #[cfg(not(target_family = "unix"))]
-                {
-                    false
-                }
-            };
-
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(!config.readonly);
-            let mut file = options.open(&path)?;
+        let mut writer = if let Some(mut file) = existing_file {
             if config.readonly {
                 fs2::FileExt::try_lock_shared(&file).map_err(|error| {
                     LogFsError::new_internal(format!("Could not acquire shared log lock: {error}"))
@@ -724,8 +778,27 @@ impl Journal2 {
                 })?;
             }
 
+            let meta = file.metadata()?;
+            if meta.is_dir() {
+                return Err(LogFsError::new_internal("Database path is a directory"));
+            }
+            let is_block_device = {
+                #[cfg(target_family = "unix")]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    meta.file_type().is_block_device()
+                }
+                #[cfg(not(target_family = "unix"))]
+                {
+                    false
+                }
+            };
+
+            // All creation/format decisions use metadata from the locked
+            // descriptor, not a pathname lookup that can become stale.
+            let locked_len = file.metadata()?.len();
             if let Some(offset) = config.offset {
-                if meta.len() < offset && !is_block_device {
+                if locked_len < offset && !is_block_device {
                     return Err(LogFsError::new_internal(
                         "config specified byte offset, but the specified file is smaller  then the offset",
                     ));
@@ -734,7 +807,7 @@ impl Journal2 {
                 file.seek(io::SeekFrom::Start(offset))?;
             }
 
-            if meta.len() == config.offset.unwrap_or_default() && !is_block_device {
+            if locked_len == config.offset.unwrap_or_default() && !is_block_device {
                 // File is exactly at the offset - treat as new file.
                 if !config.allow_create {
                     return Err(LogFsError::new_internal(
@@ -771,17 +844,18 @@ impl Journal2 {
                     LogFsError::new_internal("Database does not exist and creation is disabled")
                 });
             }
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
                 .read(true)
                 .write(true)
                 .open(&path)?;
-            if let Some(offset) = config.offset {
-                file.set_len(offset)?;
-            }
             fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
                 LogFsError::new_internal(format!("Could not acquire exclusive log lock: {error}"))
             })?;
+            if let Some(offset) = config.offset {
+                file.set_len(offset)?;
+                file.seek(io::SeekFrom::Start(offset))?;
+            }
 
             LogWriter::create_new(
                 crypto.clone(),
@@ -904,19 +978,6 @@ impl Journal2 {
         Ok(writer)
     }
 
-    /* fn open_and_truncate_file(
-        path: &std::path::Path,
-        new_length: u64,
-    ) -> Result<std::fs::File, std::io::Error> {
-        let f = std::fs::OpenOptions::new()
-            .create(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        f.set_len(new_length)?;
-        Ok(f)
-    } */
-
     fn write_entry(
         &self,
         action: data::JournalAction,
@@ -999,6 +1060,7 @@ impl Journal2 {
             hash: Some(hash.into()),
             crypto_domain: entry.crypto_domain,
             log_identity: entry.log_identity,
+            derived_crypto: entry.derived_crypto,
         })
     }
 
@@ -1060,7 +1122,7 @@ impl Journal2 {
             self.backing.clone(),
             true,
         )?;
-        reader.read_all()?;
+        reader.verify_to_end()?;
         Ok(pointer.hash.is_some())
     }
 
@@ -1129,6 +1191,7 @@ fn apply_entry(state: &mut crate::state::State, entry: PersistedEntry) -> Result
                     hash: Some(key.hash.0),
                     crypto_domain: entry.crypto_domain,
                     log_identity: entry.log_identity,
+                    derived_crypto: entry.derived_crypto,
                 },
             )
         }
@@ -1184,6 +1247,12 @@ struct IndexedSuperBlock {
     format: RootFormat,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum V3CryptoSuite {
+    Legacy,
+    DerivedKeys,
+}
+
 #[derive(Clone, Debug)]
 enum RootFormat {
     LegacyV2,
@@ -1191,6 +1260,7 @@ enum RootFormat {
         identity: [u8; 16],
         generation: u64,
         last_nonce_domain: u64,
+        crypto_suite: V3CryptoSuite,
     },
 }
 
@@ -1202,6 +1272,7 @@ const V3_ROOT_RECORD_LEN: usize = V3_ROOT_SLOT_SIZE as usize;
 const V3_ROOT_MAGIC_COPY_OFFSET: usize = V3_ROOT_RECORD_LEN - V3_ROOT_MAGIC.len();
 const V3_ROOT_PREFIX_LEN: usize = 60;
 const V3_ROOT_FLAG_ENCRYPTED: u8 = 1;
+const V3_ROOT_FLAG_DERIVED_KEYS: u8 = 1 << 1;
 const V3_PLAIN_METADATA_CHECKSUM_LEN: usize = 32;
 
 fn v3_aad(identity: [u8; 16], domain: u64, chunk: data::ChunkIndex) -> [u8; 28] {

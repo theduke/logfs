@@ -244,12 +244,6 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             recovery_path,
             skip_bytes,
         } => {
-            // Edition 2024 marks set_var unsafe to highlight potential data races.
-            unsafe {
-                std::env::set_var("RUST_LOG", "logfs=trace");
-            }
-            tracing_subscriber::fmt::init();
-
             let config = opt.build_config();
             let dry_run = !overwrite;
             let r = logfs::RepairConfig {
@@ -273,14 +267,10 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             let old_db = logfs::LogFs::<J>::open(source_config)?;
             let source_scrub = old_db.scrub()?;
             if source_scrub.keys_unverifiable != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "source contains {} legacy values without recoverable whole-value hashes",
-                        source_scrub.keys_unverifiable
-                    ),
-                )
-                .into());
+                eprintln!(
+                    "warning: {} legacy values have no historical whole-value hash; copying them with all available framing/authentication checks",
+                    source_scrub.keys_unverifiable
+                );
             }
 
             eprintln!("Creating new database...");
@@ -288,12 +278,6 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             let sequence = old_db.superblock()?.active_sequence;
 
             let new_path: std::path::PathBuf = new_path.into();
-            if new_path.exists() {
-                return Err(logfs::LogFsError::from(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "compact destination already exists",
-                )));
-            }
             let new_config = LogConfig {
                 readonly: false,
                 path: new_path,
@@ -313,7 +297,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                 full_index_write_interval: sequence,
             };
 
-            let new_db = logfs::LogFs::<J>::open_durable(new_config.clone())?;
+            let new_db = logfs::LogFs::<logfs::Journal2>::create_new_durable(new_config.clone())?;
             let all_keys = old_db.paths_range(..)?;
 
             let keys_plus_size: Vec<(String, KeyMeta)> = all_keys
@@ -351,24 +335,13 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                     key
                 );
 
-                // Keys smaller than 100mb: just load them into memory
-                if meta.size < 100_000_000 {
-                    let value = old_db.get(&key)?.ok_or_else(|| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            format!("source key disappeared during compact: {key}"),
-                        )
-                    })?;
-                    new_db.insert(key, value)?;
-                } else {
-                    let mut reader = old_db.get_reader(&key)?;
-                    let mut writer = new_db.insert_writer(&key)?;
-                    if let Err(error) = std::io::copy(&mut reader, &mut writer) {
-                        writer.abort()?;
-                        return Err(error.into());
-                    }
-                    writer.finish()?;
+                let mut reader = old_db.get_reader(&key)?;
+                let mut writer = new_db.insert_writer(&key)?;
+                if let Err(error) = std::io::copy(&mut reader, &mut writer) {
+                    writer.abort()?;
+                    return Err(error.into());
                 }
+                writer.finish()?;
 
                 finished_size += meta.size as f64;
             }
@@ -376,7 +349,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             new_db.checkpoint()?;
             new_db.sync()?;
             drop(new_db);
-            let reopened = logfs::LogFs::<J>::open(LogConfig {
+            let reopened = logfs::LogFs::<logfs::Journal2>::open(LogConfig {
                 allow_create: false,
                 readonly: true,
                 ..new_config
@@ -431,7 +404,15 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 fn main() -> Result<(), logfs::LogFsError> {
     let opt = Options::parse();
 
-    tracing_subscriber::fmt::init();
+    if matches!(opt.cmd, Subcommand::Repair { .. }) && std::env::var_os("RUST_LOG").is_none() {
+        // SAFETY: startup is single-threaded and tracing has not initialized yet.
+        unsafe { std::env::set_var("RUST_LOG", "logfs=trace") };
+    }
+    tracing_subscriber::fmt::try_init().map_err(|error| {
+        logfs::LogFsError::from(std::io::Error::other(format!(
+            "could not initialize tracing: {error}"
+        )))
+    })?;
 
     let version = opt.version.unwrap_or(2);
     if version == 2 {

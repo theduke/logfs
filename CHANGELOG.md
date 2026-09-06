@@ -1,5 +1,15 @@
 # Unreleased
 
+* Correct the encrypted v3 key schedule with an authenticated suite flag and
+  HKDF-derived per-file root/entry keys, while retaining unflagged-v3 read/write
+  compatibility.
+* Bind corrected v3 roots to their slots and validate adjacent generation pairs;
+  fix v2/v3 discrimination when legacy value bytes resemble a v3 marker.
+* Fix encrypted legacy-v2 empty writes, bound checkpoint payloads before
+  allocation, and stream scrub/compaction verification.
+* Allow checkpoint-restored v2 data to be compacted with its available integrity
+  coverage, make repair/compact destination creation exclusive, use locked
+  descriptor metadata for format decisions, and initialize CLI tracing once.
 * Add the v3 authenticated/checksummed root envelope, per-entry encrypted nonce
   domains, and v3 checkpoints that retain value-integrity metadata while keeping
   legacy v2 decoding intact.

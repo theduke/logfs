@@ -31,11 +31,17 @@ pub(crate) const FAIL_ROOT_SYNC: u8 = 6;
 #[cfg(test)]
 thread_local! {
     static TEST_FAIL_POINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static TEST_LEGACY_V3_SUITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn inject_next_io_failure(point: u8) {
     TEST_FAIL_POINT.with(|value| value.set(point));
+}
+
+#[cfg(test)]
+pub(crate) fn use_legacy_v3_suite_for_next_open(enabled: bool) {
+    TEST_LEGACY_V3_SUITE.with(|value| value.set(enabled));
 }
 
 fn maybe_fail_io(point: u8) -> std::io::Result<()> {
@@ -77,6 +83,7 @@ pub(crate) struct LogWriter {
     base_offset: u64,
 
     crypto: Option<Arc<Crypto>>,
+    v3_crypto: Option<crate::crypto::V3Crypto>,
     next_sequence: SequenceId,
     offset: data::Offset,
     writer: BufWriter<std::fs::File>,
@@ -172,11 +179,26 @@ impl LogWriter {
         random
             .fill(&mut identity)
             .map_err(|_| LogFsError::new_internal("Could not generate v3 log identity"))?;
+        #[cfg(test)]
+        let crypto_suite = TEST_LEGACY_V3_SUITE.with(|value| {
+            if value.replace(false) {
+                super::V3CryptoSuite::Legacy
+            } else {
+                super::V3CryptoSuite::DerivedKeys
+            }
+        });
+        #[cfg(not(test))]
+        let crypto_suite = super::V3CryptoSuite::DerivedKeys;
         let first_entry_offset = base_offset
             .checked_add(v3_entry_start)
             .ok_or_else(|| LogFsError::new_internal("Base offset overflow"))?;
         let mut s = Self {
             base_offset,
+            v3_crypto: if crypto_suite == super::V3CryptoSuite::DerivedKeys {
+                crypto.as_ref().map(|crypto| crypto.v3_crypto(identity))
+            } else {
+                None
+            },
             crypto,
             next_sequence: SequenceId::first(),
             offset: first_entry_offset,
@@ -195,6 +217,7 @@ impl LogWriter {
                     identity,
                     generation: 0,
                     last_nonce_domain: u64::from_le_bytes(identity[..8].try_into().unwrap()),
+                    crypto_suite,
                 },
             },
             actions_since_last_index_write: 0,
@@ -233,8 +256,20 @@ impl LogWriter {
             .ok_or_else(|| LogFsError::new_internal("Committed tail offset overflow"))?;
         file.seek(SeekFrom::Start(offset))?;
 
+        let v3_crypto = match (&crypto, &block.format) {
+            (
+                Some(crypto),
+                super::RootFormat::V3 {
+                    identity,
+                    crypto_suite: super::V3CryptoSuite::DerivedKeys,
+                    ..
+                },
+            ) => Some(crypto.v3_crypto(*identity)),
+            _ => None,
+        };
         let s = Self {
             base_offset,
+            v3_crypto,
             crypto,
             next_sequence: SequenceId::from_u64(block.block.active_sequence + 1),
             offset,
@@ -332,12 +367,14 @@ impl LogWriter {
                 identity,
                 generation,
                 last_nonce_domain,
+                crypto_suite,
             } => super::RootFormat::V3 {
                 identity,
                 generation: generation
                     .checked_add(1)
                     .ok_or_else(|| LogFsError::new_internal("V3 root generation exhausted"))?,
                 last_nonce_domain,
+                crypto_suite,
             },
         };
         let block = IndexedSuperBlock {
@@ -395,6 +432,7 @@ impl LogWriter {
                 identity,
                 generation,
                 last_nonce_domain,
+                crypto_suite,
             } => {
                 let mut payload = bincode::serialize(&super::V3RootPayload {
                     block: block.block.clone(),
@@ -418,11 +456,19 @@ impl LogWriter {
                 let mut buffer = vec![0u8; super::V3_ROOT_RECORD_LEN];
                 buffer[..8].copy_from_slice(&super::V3_ROOT_MAGIC);
                 buffer[8..16].copy_from_slice(&super::V3_ROOT_MAGIC);
-                buffer[16] = if encrypted {
+                buffer[16] = (if encrypted {
                     super::V3_ROOT_FLAG_ENCRYPTED
                 } else {
                     0
+                }) | if crypto_suite == super::V3CryptoSuite::DerivedKeys {
+                    super::V3_ROOT_FLAG_DERIVED_KEYS
+                } else {
+                    0
                 };
+                if crypto_suite == super::V3CryptoSuite::DerivedKeys {
+                    buffer[17] = u8::try_from(block.index)
+                        .map_err(|_| LogFsError::new_internal("V3 root slot overflow"))?;
+                }
                 buffer[20..28].copy_from_slice(&generation.to_le_bytes());
                 buffer[28..44].copy_from_slice(&identity);
                 let mut nonce = [0u8; 12];
@@ -438,13 +484,24 @@ impl LogWriter {
                     .map_err(|_| LogFsError::new_internal("V3 root payload length overflow"))?;
                 buffer[56..60].copy_from_slice(&final_payload_len.to_le_bytes());
                 if encrypted {
-                    self.crypto()
-                        .ok_or_else(|| LogFsError::new_internal("Missing v3 encryption key"))?
-                        .encrypt_with_nonce(
-                            nonce,
-                            &buffer[..super::V3_ROOT_PREFIX_LEN],
-                            &mut payload,
-                        )?;
+                    if crypto_suite == super::V3CryptoSuite::DerivedKeys {
+                        self.v3_crypto
+                            .as_ref()
+                            .ok_or_else(|| LogFsError::new_internal("Missing derived v3 key"))?
+                            .encrypt_root(
+                                nonce,
+                                &buffer[..super::V3_ROOT_PREFIX_LEN],
+                                &mut payload,
+                            )?;
+                    } else {
+                        self.crypto()
+                            .ok_or_else(|| LogFsError::new_internal("Missing v3 encryption key"))?
+                            .encrypt_with_nonce(
+                                nonce,
+                                &buffer[..super::V3_ROOT_PREFIX_LEN],
+                                &mut payload,
+                            )?;
+                    }
                 }
                 let payload_end = super::V3_ROOT_PREFIX_LEN + payload.len();
                 let required = payload_end + if encrypted { 0 } else { 32 };
@@ -483,6 +540,7 @@ impl LogWriter {
             identity,
             generation,
             last_nonce_domain,
+            crypto_suite,
         } = self.active_superblock.format
         else {
             self.current_crypto_domain = None;
@@ -495,6 +553,7 @@ impl LogWriter {
             identity,
             generation,
             last_nonce_domain: domain,
+            crypto_suite,
         };
         self.write_next_superblock()?;
         // An encrypted nonce domain must reach stable storage before any
@@ -511,6 +570,7 @@ impl LogWriter {
         let super::RootFormat::V3 {
             identity,
             generation,
+            crypto_suite,
             ..
         } = self.active_superblock.format
         else {
@@ -524,6 +584,7 @@ impl LogWriter {
             identity,
             generation,
             last_nonce_domain: u64::from_le_bytes(bytes),
+            crypto_suite,
         };
         self.write_next_superblock()?;
         if self.crypto.is_some() {
@@ -637,6 +698,7 @@ impl LogWriter {
             file_data_offset: data_offset,
             crypto_domain: self.current_crypto_domain,
             log_identity: self.v3_identity(),
+            derived_crypto: self.v3_crypto.is_some(),
         };
         self.current_crypto_domain = None;
 
@@ -663,7 +725,9 @@ impl LogWriter {
             .unwrap_or_else(|| sequence.as_u64());
         if let Some(identity) = self.v3_identity() {
             let aad = super::v3_aad(identity, domain, ENTRY_ACTION_CHUNK);
-            if let Some(crypto) = self.crypto.as_ref() {
+            if let Some(crypto) = self.v3_crypto.as_ref() {
+                crypto.encrypt_entry(domain, ENTRY_ACTION_CHUNK, &aad, &mut action_data)?;
+            } else if let Some(crypto) = self.crypto.as_ref() {
                 crypto.encrypt_data_with_aad(domain, ENTRY_ACTION_CHUNK, &aad, &mut action_data)?;
             } else {
                 super::append_plain_metadata_checksum(&mut action_data, &aad);
@@ -689,7 +753,9 @@ impl LogWriter {
         debug_assert_eq!(header_data.len(), data::JournalEntryHeader::SERIALIZED_LEN);
         if let Some(identity) = self.v3_identity() {
             let aad = super::v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
-            if let Some(crypto) = self.crypto.as_ref() {
+            if let Some(crypto) = self.v3_crypto.as_ref() {
+                crypto.encrypt_entry(domain, ENTRY_HEADER_CHUNK, &aad, &mut header_data)?;
+            } else if let Some(crypto) = self.crypto.as_ref() {
                 crypto.encrypt_data_with_aad(domain, ENTRY_HEADER_CHUNK, &aad, &mut header_data)?;
             } else {
                 super::append_plain_metadata_checksum(&mut header_data, &aad);
@@ -758,8 +824,12 @@ impl LogWriter {
     fn write_data(&mut self, chunk_size: u32, data: Vec<u8>) -> Result<u64, LogFsError> {
         if chunk_size == 0 {
             if data.is_empty() {
-                let mut empty = Vec::new();
-                return self.write_data_chunk(ENTRY_FIRST_DATA_CHUNK, &mut empty);
+                return if self.v3_identity().is_some() {
+                    let mut empty = Vec::new();
+                    self.write_data_chunk(ENTRY_FIRST_DATA_CHUNK, &mut empty)
+                } else {
+                    Ok(0)
+                };
             }
             return Err(LogFsError::new_internal(
                 "Chunk size must be greater than zero",
@@ -770,7 +840,9 @@ impl LogWriter {
         let mut full_len = 0u64;
         let mut scratch = Vec::with_capacity(chunk_size.saturating_add(Crypto::EXTRA_PAYLOAD_LEN));
         if data.is_empty() {
-            full_len += self.write_data_chunk(ENTRY_FIRST_DATA_CHUNK, &mut scratch)?;
+            if self.v3_identity().is_some() {
+                full_len += self.write_data_chunk(ENTRY_FIRST_DATA_CHUNK, &mut scratch)?;
+            }
             return Ok(full_len);
         }
         for (index, source) in data.chunks(chunk_size).enumerate() {
@@ -906,7 +978,10 @@ impl LogWriter {
         let domain = self
             .current_crypto_domain
             .unwrap_or_else(|| self.next_sequence.as_u64());
-        if let (Some(crypto), Some(identity)) = (self.crypto.as_ref(), self.v3_identity()) {
+        if let (Some(crypto), Some(identity)) = (self.v3_crypto.as_ref(), self.v3_identity()) {
+            let aad = super::v3_aad(identity, domain, chunk);
+            crypto.encrypt_entry(domain, chunk, &aad, data)?;
+        } else if let (Some(crypto), Some(identity)) = (self.crypto.as_ref(), self.v3_identity()) {
             let aad = super::v3_aad(identity, domain, chunk);
             crypto.encrypt_data_with_aad(domain, chunk, &aad, data)?;
         } else if let Some(crypto) = self.crypto.as_ref() {
@@ -1010,7 +1085,7 @@ impl LogChunkWriter {
                 ));
             }
             self.write_chunk(data, true)?;
-        } else if self.data_size == 0 {
+        } else if self.data_size == 0 && self.writer.v3_identity().is_some() {
             let mut empty = Vec::new();
             self.write_chunk(&mut empty, true)?;
         }
@@ -1052,6 +1127,7 @@ impl LogChunkWriter {
             hash: Some(meta.hash.0),
             crypto_domain: writer.current_crypto_domain,
             log_identity: writer.v3_identity(),
+            derived_crypto: writer.v3_crypto.is_some(),
         };
 
         writer.offset = end_offset;

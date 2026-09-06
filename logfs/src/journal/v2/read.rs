@@ -18,6 +18,7 @@ pub struct LogReader<'a, R> {
     // TODO: should be private!
     pub next_sequence: SequenceId,
     crypto: Option<&'a Crypto>,
+    v3_crypto: Option<crate::crypto::V3Crypto>,
     buffer: Vec<u8>,
     // TODO: should be private!
     pub reader: BufReader<R>,
@@ -67,6 +68,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             offset: base_offset,
             next_sequence: SequenceId::first(),
             crypto,
+            v3_crypto: None,
             buffer: Vec::new(),
             reader: BufReader::new(reader),
             committed_end: None,
@@ -77,6 +79,47 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
 
     pub(super) fn read_superblocks(&mut self) -> Result<IndexedSuperBlock, LogFsError> {
         let file_end = self.reader.seek(SeekFrom::End(0))?;
+        // A v2 value may occupy the offsets where v3's aligned roots live. A
+        // marker-shaped payload must therefore never decide the format. Prefer
+        // a fully validated legacy root set before probing the v3 envelope.
+        self.reader.seek(SeekFrom::Start(self.base_offset))?;
+        let mut legacy_best = None;
+        for index in 0..data::Superblock::HEADER_COUNT as usize {
+            let root_end = self
+                .base_offset
+                .checked_add((index as u64 + 1) * data::Superblock::SERIALIZED_LEN)
+                .ok_or_else(|| LogFsError::new_internal("Legacy root offset overflow"))?;
+            if root_end > file_end {
+                break;
+            }
+            let mut raw = vec![0; data::Superblock::SERIALIZED_LEN as usize];
+            self.reader.read_exact(&mut raw)?;
+            if let Some(crypto) = self.crypto {
+                raw = match crypto.decrypt_data(0, index as u32, raw) {
+                    Ok(raw) => raw,
+                    Err(_) => continue,
+                };
+            }
+            let Ok(candidate) = bincode::deserialize::<data::Superblock>(&raw) else {
+                continue;
+            };
+            if candidate.format_version != data::LogFormatVersion::V2 {
+                continue;
+            }
+            let format = super::RootFormat::LegacyV2;
+            if validate_root(&candidate, &format, self.base_offset, file_end).is_err() {
+                continue;
+            }
+            if legacy_best.as_ref().is_none_or(|old: &IndexedSuperBlock| {
+                candidate.active_sequence > old.block.active_sequence
+            }) {
+                legacy_best = Some(IndexedSuperBlock {
+                    block: candidate,
+                    index,
+                    format,
+                });
+            }
+        }
         let mut v3_roots = Vec::new();
         let mut v3_marker_seen = false;
         for index in 0..super::V3_ROOT_COUNT as usize {
@@ -106,24 +149,45 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             v3_roots.push((index, raw, primary, copy));
         }
 
-        let block = if v3_marker_seen {
+        let block = if let Some(block) = legacy_best {
+            block
+        } else if v3_marker_seen {
             if v3_roots.len() != super::V3_ROOT_COUNT as usize {
                 return Err(LogFsError::new_internal("Truncated v3 root area"));
             }
             let mut parsed = Vec::with_capacity(v3_roots.len());
             let mut identity = None;
+            let mut suite = None;
             for (index, raw, primary, copy) in v3_roots {
                 if !primary || !copy {
                     return Err(LogFsError::new_internal(
                         "Corrupt redundant v3 format marker; refusing rollback",
                     ));
                 }
-                if raw[17..20] != [0, 0, 0] {
-                    return Err(LogFsError::new_internal("Corrupt v3 root reserved fields"));
-                }
                 let flags = raw[16];
-                if flags & !super::V3_ROOT_FLAG_ENCRYPTED != 0 {
+                if flags & !(super::V3_ROOT_FLAG_ENCRYPTED | super::V3_ROOT_FLAG_DERIVED_KEYS) != 0
+                {
                     return Err(LogFsError::new_internal("Unsupported v3 root flags"));
+                }
+                let root_suite = if flags & super::V3_ROOT_FLAG_DERIVED_KEYS != 0 {
+                    super::V3CryptoSuite::DerivedKeys
+                } else {
+                    super::V3CryptoSuite::Legacy
+                };
+                if suite.is_some_and(|known| known != root_suite) {
+                    return Err(LogFsError::new_internal(
+                        "Conflicting v3 crypto suites in root slots",
+                    ));
+                }
+                suite = Some(root_suite);
+                if root_suite == super::V3CryptoSuite::DerivedKeys {
+                    if raw[17] != index as u8 || raw[18..20] != [0, 0] {
+                        return Err(LogFsError::new_internal(
+                            "V3 root is not bound to its physical slot",
+                        ));
+                    }
+                } else if raw[17..20] != [0, 0, 0] {
+                    return Err(LogFsError::new_internal("Corrupt v3 root reserved fields"));
                 }
                 let generation = u64::from_le_bytes(
                     raw[20..28]
@@ -176,9 +240,20 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
                     let crypto = self.crypto.ok_or_else(|| {
                         LogFsError::new_internal("Encrypted v3 log requires a key")
                     })?;
-                    payload = crypto
-                        .decrypt_with_nonce(nonce, &raw[..super::V3_ROOT_PREFIX_LEN], &mut payload)?
-                        .to_vec();
+                    payload = if root_suite == super::V3CryptoSuite::DerivedKeys {
+                        crypto
+                            .v3_crypto(root_identity)
+                            .decrypt_root(nonce, &raw[..super::V3_ROOT_PREFIX_LEN], &mut payload)?
+                            .to_vec()
+                    } else {
+                        crypto
+                            .decrypt_with_nonce(
+                                nonce,
+                                &raw[..super::V3_ROOT_PREFIX_LEN],
+                                &mut payload,
+                            )?
+                            .to_vec()
+                    };
                 } else {
                     let actual: [u8; 32] = sha2::Sha256::digest(&raw[..payload_end]).into();
                     if actual != raw[payload_end..integrity_end] {
@@ -193,6 +268,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
                     identity: root_identity,
                     generation,
                     last_nonce_domain: payload.last_nonce_domain,
+                    crypto_suite: root_suite,
                 };
                 validate_root(&payload.block, &format, self.base_offset, file_end)?;
                 parsed.push(IndexedSuperBlock {
@@ -200,6 +276,22 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
                     index,
                     format,
                 });
+            }
+            if suite == Some(super::V3CryptoSuite::DerivedKeys) {
+                let generation = |root: &IndexedSuperBlock| match root.format {
+                    super::RootFormat::V3 { generation, .. } => generation,
+                    super::RootFormat::LegacyV2 => unreachable!(),
+                };
+                if parsed.len() != 2
+                    || parsed
+                        .iter()
+                        .any(|root| generation(root) % 2 != root.index as u64)
+                    || generation(&parsed[0]).abs_diff(generation(&parsed[1])) != 1
+                {
+                    return Err(LogFsError::new_internal(
+                        "V3 root pair has inconsistent slots or generations",
+                    ));
+                }
             }
             parsed
                 .into_iter()
@@ -209,38 +301,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
                 })
                 .ok_or_else(|| LogFsError::new_internal("Could not find a v3 root"))?
         } else {
-            self.reader.seek(SeekFrom::Start(self.base_offset))?;
-            let mut best = None;
-            for index in 0..data::Superblock::HEADER_COUNT as usize {
-                let mut raw = vec![0; data::Superblock::SERIALIZED_LEN as usize];
-                self.reader.read_exact(&mut raw)?;
-                if let Some(crypto) = self.crypto {
-                    raw = match crypto.decrypt_data(0, index as u32, raw) {
-                        Ok(raw) => raw,
-                        Err(_) => continue,
-                    };
-                }
-                let Ok(candidate) = bincode::deserialize::<data::Superblock>(&raw) else {
-                    continue;
-                };
-                if candidate.format_version != data::LogFormatVersion::V2 {
-                    continue;
-                }
-                let format = super::RootFormat::LegacyV2;
-                if validate_root(&candidate, &format, self.base_offset, file_end).is_err() {
-                    continue;
-                }
-                if best.as_ref().is_none_or(|old: &IndexedSuperBlock| {
-                    candidate.active_sequence > old.block.active_sequence
-                }) {
-                    best = Some(IndexedSuperBlock {
-                        block: candidate,
-                        index,
-                        format,
-                    });
-                }
-            }
-            best.ok_or_else(|| LogFsError::new_internal("Could not find a superblock"))?
+            return Err(LogFsError::new_internal("Could not find a superblock"));
         };
         self.reader.seek(SeekFrom::Start(
             self.base_offset
@@ -263,11 +324,26 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             super::RootFormat::V3 { identity, .. } => Some(identity),
             super::RootFormat::LegacyV2 => None,
         };
+        self.v3_crypto = match (&block.format, self.crypto) {
+            (
+                super::RootFormat::V3 {
+                    identity,
+                    crypto_suite: super::V3CryptoSuite::DerivedKeys,
+                    ..
+                },
+                Some(crypto),
+            ) => Some(crypto.v3_crypto(*identity)),
+            _ => None,
+        };
         Ok(block)
     }
 
     pub(super) fn v3_identity(&self) -> Option<[u8; 16]> {
         self.v3_identity
+    }
+
+    pub(super) fn uses_derived_crypto(&self) -> bool {
+        self.v3_crypto.is_some()
     }
 
     pub(super) fn crypto_padding(&self) -> u64 {
@@ -404,7 +480,9 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         let domain = crypto_domain.unwrap_or_else(|| sequence.as_u64());
         let header_data = if let Some(identity) = self.v3_identity {
             let aad = super::v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
-            if let Some(crypto) = &self.crypto {
+            if let Some(crypto) = &self.v3_crypto {
+                crypto.decrypt_entry_ref(domain, ENTRY_HEADER_CHUNK, &aad, buffer)?
+            } else if let Some(crypto) = &self.crypto {
                 crypto.decrypt_data_ref_with_aad(domain, ENTRY_HEADER_CHUNK, &aad, buffer)?
             } else {
                 super::verify_plain_metadata_checksum(buffer, &aad)?
@@ -463,7 +541,9 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
 
         let action_data = if let Some(identity) = self.v3_identity {
             let aad = super::v3_aad(identity, domain, ENTRY_ACTION_CHUNK);
-            if let Some(crypto) = &self.crypto {
+            if let Some(crypto) = &self.v3_crypto {
+                crypto.decrypt_entry_ref(domain, ENTRY_ACTION_CHUNK, &aad, buffer)?
+            } else if let Some(crypto) = &self.crypto {
                 crypto.decrypt_data_ref_with_aad(domain, ENTRY_ACTION_CHUNK, &aad, buffer)?
             } else {
                 super::verify_plain_metadata_checksum(buffer, &aad)?
@@ -476,6 +556,11 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
 
         let action: data::JournalAction =
             super::deserialize_bounded(action_data, super::MAX_ACTION_BYTES)?;
+        if data_buffer.is_some() && !action.is_index_write() {
+            return Err(LogFsError::new_internal(
+                "Checkpoint pointer does not reference an index entry",
+            ));
+        }
         let data_len = if !self.v3_entries
             && matches!(
                 &action,
@@ -495,6 +580,11 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
                 "Incomplete entry payload inside committed history",
             ));
         }
+        if data_buffer.is_some() && data_len > super::MAX_CHECKPOINT_DECODED_BYTES as u64 {
+            return Err(LogFsError::new_internal(
+                "Checkpoint payload exceeds the 512 MiB resource limit",
+            ));
+        }
         let data_len_usize = usize::try_from(data_len)
             .map_err(|_| LogFsError::new_internal("Entry payload does not fit in memory"))?;
 
@@ -504,7 +594,13 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             buffer_ref.resize(data_len_usize, 0);
             self.reader.read_exact(buffer_ref)?;
 
-            if let Some(crypto) = &self.crypto {
+            if let Some(crypto) = &self.v3_crypto {
+                let identity = self.v3_identity.ok_or_else(|| {
+                    LogFsError::new_internal("Derived v3 entry is missing its log identity")
+                })?;
+                let aad = super::v3_aad(identity, domain, ENTRY_FIRST_DATA_CHUNK);
+                crypto.decrypt_entry_ref(domain, ENTRY_FIRST_DATA_CHUNK, &aad, buffer_ref)?
+            } else if let Some(crypto) = &self.crypto {
                 if let Some(identity) = self.v3_identity {
                     let aad = super::v3_aad(identity, domain, ENTRY_FIRST_DATA_CHUNK);
                     crypto.decrypt_data_ref_with_aad(
@@ -534,6 +630,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             file_data_offset: data_offset,
             crypto_domain,
             log_identity: self.v3_identity,
+            derived_crypto: self.v3_crypto.is_some(),
         };
         Ok((entry, decrypted_data))
     }
@@ -619,6 +716,7 @@ pub struct KeyDataReader {
     consumed_size: u64,
     crypto_domain: Option<u64>,
     log_identity: Option<[u8; 16]>,
+    v3_crypto: Option<crate::crypto::V3Crypto>,
     value_hasher: Option<sha2::Sha256>,
 }
 
@@ -649,6 +747,18 @@ impl KeyDataReader {
             backing,
             position: pointer.file_offset,
         });
+        let v3_crypto = if pointer.derived_crypto {
+            Some(
+                crypto
+                    .as_ref()
+                    .ok_or_else(|| LogFsError::new_internal("Encrypted v3 value requires a key"))?
+                    .v3_crypto(pointer.log_identity.ok_or_else(|| {
+                        LogFsError::new_internal("Derived v3 value is missing its log identity")
+                    })?),
+            )
+        } else {
+            None
+        };
         if pointer.chunk_size == Some(0) {
             return Err(LogFsError::new_internal("Stored chunk size is zero"));
         }
@@ -703,6 +813,7 @@ impl KeyDataReader {
             consumed_size: 0,
             crypto_domain: pointer.crypto_domain,
             log_identity: pointer.log_identity,
+            v3_crypto,
             value_hasher: verify_hash.then(sha2::Sha256::new),
         })
     }
@@ -721,6 +832,15 @@ impl KeyDataReader {
         self.verify_complete()?;
 
         Ok(data)
+    }
+
+    pub(crate) fn verify_to_end(mut self) -> Result<(), LogFsError> {
+        let mut buffer = Vec::with_capacity(self.chunk_size.min(1024 * 1024));
+        while !self.is_finished() {
+            buffer = self.read_next_chunk(buffer)?;
+            buffer.clear();
+        }
+        self.verify_complete()
     }
 
     fn read_next_chunk(&mut self, mut buffer: Vec<u8>) -> Result<Vec<u8>, LogFsError> {
@@ -751,7 +871,13 @@ impl KeyDataReader {
         self.reader.read_exact(&mut buffer)?;
 
         let domain = self.crypto_domain.unwrap_or_else(|| self.sequence.as_u64());
-        let data = if let Some(crypto) = self.crypto.as_ref() {
+        let data = if let Some(crypto) = self.v3_crypto.as_ref() {
+            let identity = self.log_identity.ok_or_else(|| {
+                LogFsError::new_internal("Derived v3 value is missing its log identity")
+            })?;
+            let aad = super::v3_aad(identity, domain, chunk);
+            crypto.decrypt_entry(domain, chunk, &aad, buffer)?
+        } else if let Some(crypto) = self.crypto.as_ref() {
             if let Some(identity) = self.log_identity {
                 let aad = super::v3_aad(identity, domain, chunk);
                 crypto.decrypt_data_with_aad(domain, chunk, &aad, buffer)?
@@ -989,5 +1115,44 @@ impl Iterator for KeyChunkIter {
         } else {
             Some(self.reader.read_next_chunk(Vec::new()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Journal2, LogConfig, LogFs};
+
+    #[test]
+    fn checkpoint_probe_rejects_non_index_before_payload_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("malformed-checkpoint.log");
+        let config = LogConfig {
+            path: path.clone(),
+            raw_mode: false,
+            offset: None,
+            allow_create: true,
+            crypto: None,
+            default_chunk_size: 1024 * 1024,
+            partial_index_write_interval: 0,
+            full_index_write_interval: 0,
+            readonly: false,
+        };
+        let log = LogFs::<Journal2>::open(config).unwrap();
+        log.insert("not-an-index", vec![0x5a; 8 * 1024 * 1024])
+            .unwrap();
+        drop(log);
+
+        let file = std::fs::File::open(path).unwrap();
+        let mut reader = LogReader::new_start(file, 0, None);
+        reader.read_superblocks().unwrap();
+        let mut payload = Vec::new();
+        let error = reader.next_entry(Some(&mut payload)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not reference an index entry")
+        );
+        assert_eq!(payload.capacity(), 0);
     }
 }

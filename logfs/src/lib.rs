@@ -668,6 +668,36 @@ impl<J: JournalStore> LogFs<J> {
     }
 }
 
+impl LogFs<Journal2> {
+    /// Atomically create a new durable log, failing if the destination path
+    /// already exists.
+    pub fn create_new_durable(mut config: LogConfig) -> Result<Self, LogFsError> {
+        tracing::debug!(?config, "creating log exclusively");
+        let crypto = config
+            .crypto
+            .take()
+            .map(|value| Arc::new(crypto::Crypto::new(value)));
+        let state = Arc::new(RwLock::new(state::State::new()));
+        let path = config.path.clone();
+        let journal = Journal2::create_new_exclusive(path.clone(), state.clone(), crypto, &config)?;
+        journal.set_durable(true)?;
+        journal.sync()?;
+        sync_parent_directory(&path)?;
+        Ok(Self {
+            path,
+            inner: Arc::new(Inner {
+                state,
+                config,
+                journal,
+                locks: Arc::new(Locks {
+                    key_lock: Mutex::new(false),
+                    key_lock_condvar: Condvar::new(),
+                }),
+            }),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Rename {
     pub old_key: String,
@@ -926,8 +956,107 @@ mod tests {
             "the frozen pre-v3 encrypted-empty fixture bytes changed"
         );
         config.allow_create = false;
-        let db = LogFs::<Journal2>::open(config).unwrap();
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
         assert_eq!(db.get("legacy").unwrap(), Some(expected));
+        db.insert("buffered-empty", Vec::new()).unwrap();
+        db.insert_writer("streamed-empty")
+            .unwrap()
+            .finish()
+            .unwrap();
+        drop(db);
+        let reopened = LogFs::<Journal2>::open(config).unwrap();
+        assert_eq!(reopened.get("buffered-empty").unwrap(), Some(Vec::new()));
+        assert_eq!(reopened.get("streamed-empty").unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn valid_v2_roots_win_over_marker_shaped_value_bytes() {
+        let mut config = test_config("legacy-v3-marker-payload");
+        config.crypto = None;
+        let seed = vec![0x41; 8_000];
+        write_legacy_v2_fixture(&config.path, None, seed.clone(), 0);
+        config.allow_create = false;
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+        let pointer = db
+            .inner
+            .state
+            .read()
+            .unwrap()
+            .get_key("legacy")
+            .unwrap()
+            .clone();
+        drop(db);
+
+        let marker_position = 4096u64
+            .checked_sub(pointer.file_offset)
+            .expect("fixture payload must cover the second v3 root offset");
+        let mut value = seed;
+        value[marker_position as usize..marker_position as usize + 8].copy_from_slice(b"LOGFS3R\0");
+        let expected = write_legacy_v2_fixture(&config.path, None, value, 0);
+        let reopened = LogFs::<Journal2>::open(config).unwrap();
+        assert_eq!(reopened.get("legacy").unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn reads_unflagged_encrypted_v3_and_rejects_slot_replay_in_new_suite() {
+        let config = test_config("legacy-unflagged-v3");
+        crate::journal::v2::write::use_legacy_v3_suite_for_next_open(true);
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+        db.insert("legacy-v3", b"compatible".to_vec()).unwrap();
+        drop(db);
+        let reopened = LogFs::<Journal2>::open(config.clone()).unwrap();
+        assert_eq!(
+            reopened.get("legacy-v3").unwrap(),
+            Some(b"compatible".to_vec())
+        );
+        drop(reopened);
+
+        let replay_config = test_config("v3-slot-replay");
+        let db = LogFs::<Journal2>::open(replay_config.clone()).unwrap();
+        db.insert("key", b"value".to_vec()).unwrap();
+        drop(db);
+        let bytes = std::fs::read(&replay_config.path).unwrap();
+        let generations = [
+            u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
+            u64::from_le_bytes(bytes[4096 + 20..4096 + 28].try_into().unwrap()),
+        ];
+        let older = usize::from(generations[1] < generations[0]);
+        let newer = 1 - older;
+        let old_root = bytes[older * 4096..(older + 1) * 4096].to_vec();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replay_config.path)
+            .unwrap();
+        file.seek(std::io::SeekFrom::Start((newer * 4096) as u64))
+            .unwrap();
+        file.write_all(&old_root).unwrap();
+        drop(file);
+        assert!(LogFs::<Journal2>::open(replay_config).is_err());
+    }
+
+    #[test]
+    fn exclusive_creation_preserves_existing_destination() {
+        let config = test_config("exclusive-create");
+        let sentinel = b"do not overwrite";
+        std::fs::write(&config.path, sentinel).unwrap();
+        assert!(LogFs::<Journal2>::create_new_durable(config.clone()).is_err());
+        assert_eq!(std::fs::read(config.path).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn exclusive_creation_supports_nonzero_offsets() {
+        let mut config = test_config("exclusive-create-offset");
+        config.offset = Some(37);
+        let log = LogFs::<Journal2>::create_new_durable(config.clone()).unwrap();
+        log.insert("key", b"value".to_vec()).unwrap();
+        log.sync().unwrap();
+        drop(log);
+
+        let bytes = std::fs::read(&config.path).unwrap();
+        assert_eq!(&bytes[..37], &[0; 37]);
+        config.allow_create = false;
+        let reopened = LogFs::<Journal2>::open(config).unwrap();
+        assert_eq!(reopened.get("key").unwrap(), Some(b"value".to_vec()));
     }
 
     #[test]
