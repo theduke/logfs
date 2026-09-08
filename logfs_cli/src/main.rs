@@ -9,6 +9,8 @@ use clap::Parser;
 
 #[derive(clap::Subcommand, Clone)]
 enum Subcommand {
+    /// Display filesystem statistics.
+    Stats,
     List {
         #[clap(short, long)]
         offset: Option<usize>,
@@ -143,6 +145,27 @@ fn pretty_value(value: &[u8]) -> String {
 
 fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
     match opt.cmd.clone() {
+        Subcommand::Stats => {
+            let mut config = opt.build_config();
+            config.readonly = true;
+            let db = logfs::LogFs::<J>::open(config)?;
+            let superblock = db.superblock()?;
+            let key_count = db.paths_range(..)?.len();
+
+            println!("format_version: {:?}", superblock.format_version);
+            println!("active_sequence: {}", superblock.active_sequence);
+            println!("tail_offset: {}", superblock.tail_offset);
+            println!("key_count: {key_count}");
+            println!("data_bytes: {}", db.size_data()?);
+            println!("log_bytes: {}", db.size_log()?);
+            println!("occupied_log_bytes: {}", db.occupied_log_bytes()?);
+            match db.redundant_data_estimate() {
+                Some(bytes) => println!("redundant_data_bytes_estimate: {bytes}"),
+                None => println!("redundant_data_bytes_estimate: unavailable"),
+            }
+
+            Ok(())
+        }
         Subcommand::List { offset, max } => {
             let db = logfs::LogFs::<J>::open(opt.build_config())?;
             let stdout = std::io::stdout();
