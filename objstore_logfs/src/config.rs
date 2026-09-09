@@ -116,7 +116,8 @@ impl LogFsObjStoreConfig {
         if let Some(full_interval) = self.full_index_write_interval {
             builder = builder.full_index_write_interval(full_interval);
         }
-        builder = builder.readonly(self.readonly);
+        let readonly = self.readonly || (self.requires_create_for_writes() && !self.allow_create);
+        builder = builder.readonly(readonly);
 
         let mut config = builder.build();
         if let Some(partial_interval) = self.partial_index_write_interval {
@@ -141,6 +142,10 @@ impl LogFsObjStoreConfig {
             format_version,
             ..LogOpenOptions::default()
         })
+    }
+
+    fn requires_create_for_writes(&self) -> bool {
+        self.offset.is_some() || path_is_block_device(&self.path)
     }
 
     pub fn safe_uri(&self) -> Result<Url> {
@@ -230,6 +235,9 @@ impl LogFsObjStoreConfig {
                             source: Some(source.into()),
                         }
                     })?)
+                }
+                "create" => {
+                    config.allow_create = value.is_empty() || parse_bool(&value)?;
                 }
                 "allow_create" => config.allow_create = parse_bool(&value)?,
                 "readonly" => config.readonly = parse_bool(&value)?,
@@ -355,6 +363,21 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn path_is_block_device(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        std::fs::metadata(path).is_ok_and(|metadata| metadata.file_type().is_block_device())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +400,27 @@ mod tests {
 
         let unsupported = Url::parse("logfs:///tmp/archive.log?version=1").unwrap();
         assert!(LogFsObjStoreConfig::from_url(&unsupported).is_err());
+    }
+
+    #[test]
+    fn offset_uri_is_readonly_without_create_flag() {
+        let readonly = LogFsObjStoreConfig::from_url(
+            &Url::parse("logfs:///tmp/archive.log?version=3&offset=4096").unwrap(),
+        )
+        .unwrap();
+        assert!(readonly.to_logfs_config().readonly);
+
+        let writable = LogFsObjStoreConfig::from_url(
+            &Url::parse("logfs:///tmp/archive.log?version=3&offset=4096&create").unwrap(),
+        )
+        .unwrap();
+        assert!(writable.allow_create);
+        assert!(!writable.to_logfs_config().readonly);
+
+        let explicitly_disabled = LogFsObjStoreConfig::from_url(
+            &Url::parse("logfs:///tmp/archive.log?offset=4096&create=false").unwrap(),
+        )
+        .unwrap();
+        assert!(explicitly_disabled.to_logfs_config().readonly);
     }
 }
