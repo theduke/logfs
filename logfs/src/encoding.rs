@@ -1,20 +1,10 @@
-//! Bincode 1-compatible serialization on bincode 2.
+//! Legacy v2 bincode serialization, using bincode 2's v1-compatible configuration.
 
+#[cfg(test)]
 pub(crate) fn serialize<T: serde::Serialize + ?Sized>(
     value: &T,
 ) -> Result<Vec<u8>, bincode::error::EncodeError> {
     bincode::serde::encode_to_vec(value, bincode::config::legacy())
-}
-
-pub(crate) fn serialized_size<T: serde::Serialize + ?Sized>(
-    value: &T,
-) -> Result<u64, bincode::error::EncodeError> {
-    let written = bincode::serde::encode_into_std_write(
-        value,
-        &mut std::io::sink(),
-        bincode::config::legacy(),
-    )?;
-    Ok(written as u64)
 }
 
 pub(crate) fn deserialize<T: serde::de::DeserializeOwned>(

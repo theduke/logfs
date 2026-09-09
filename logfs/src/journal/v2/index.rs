@@ -28,7 +28,7 @@ pub struct KeyIndex {
 }
 
 use crate::journal::{
-    codec::deserialize_bounded,
+    codec::deserialize_legacy_bounded,
     v3::{index::validate_restored_pointer, read},
 };
 use crate::{LogFsError, state::KeyPointer};
@@ -44,7 +44,7 @@ pub(in crate::journal) fn restore_snapshot<R: io::Read + io::Seek>(
     max_decoded_len: usize,
     tree: &mut BTreeMap<String, KeyPointer>,
 ) -> Result<Option<EntryPointer>, LogFsError> {
-    let data: KeyIndex = deserialize_bounded(data, max_decoded_len)?;
+    let data: KeyIndex = deserialize_legacy_bounded(data, max_decoded_len)?;
     if let Some(parent) = data.parent_entry
         && (parent.offset >= pointer.offset || parent.sequence >= pointer.sequence)
     {

@@ -1,5 +1,7 @@
 # Unreleased
 
+* Use Postcard 1.x for the fresh v3 wire format while retaining the legacy
+  bincode codec only for reading released v2 data.
 * Replace the unreleased development v3 formats with opaque fixed-size roots
   and journal framing. Encrypted v3 exposes only random Argon2id salts,
   XChaCha20-Poly1305 nonces, ciphertext, and unavoidable size/growth leakage;

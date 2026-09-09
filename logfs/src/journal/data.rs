@@ -50,6 +50,9 @@ impl std::fmt::Debug for Sha256Hash {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct KeyMeta {
     /// The full length of the data in bytes.
+    // Streaming v3 entries reserve their action before this value is known, so
+    // its Postcard representation must not change size during finalization.
+    #[serde(with = "postcard::fixint::le")]
     pub size: ByteCountU64,
     /// Size of the individual chunks in bytes.
     /// If None, the key is stored in a single chunk.
@@ -305,5 +308,22 @@ mod tests {
         };
         let code = crate::encoding::serialize(&header).unwrap();
         assert_eq!(code.len(), JournalEntryHeader::SERIALIZED_LEN);
+    }
+
+    #[test]
+    fn fixed_stream_size_preserves_legacy_bincode_bytes() {
+        let size = 0x0102_0304_0506_0708;
+        let meta = KeyMeta {
+            size,
+            chunk_size: None,
+            hash: Sha256Hash([0; 32]),
+            path: String::new(),
+        };
+        let encoded = crate::encoding::serialize(&meta).unwrap();
+        let mut expected = size.to_le_bytes().to_vec();
+        expected.push(0);
+        expected.extend_from_slice(&[0; 32]);
+        expected.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(encoded, expected);
     }
 }

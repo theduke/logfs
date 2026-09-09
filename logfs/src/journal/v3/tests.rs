@@ -175,10 +175,10 @@ fn action_limit_agrees_for_regular_streaming_and_replay_paths() {
     for encrypted in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(&dir, "source", encrypted);
-        limits::with_test_limits(64, 1024, || {
+        limits::with_test_limits(51, 1024, || {
             let db = LogFs::<Journal2>::open(cfg.clone()).unwrap();
             let before = std::fs::read(&cfg.path).unwrap();
-            // An insert action with Some(chunk_size) is 57 + key UTF-8 bytes.
+            // Adjacent path lengths differ by exactly one encoded byte.
             assert!(db.insert("12345678", vec![3; 17]).is_err());
             assert!(db.insert_writer("12345678").is_err());
             assert_eq!(std::fs::read(&cfg.path).unwrap(), before);
@@ -193,7 +193,7 @@ fn action_limit_agrees_for_regular_streaming_and_replay_paths() {
             drop(reopened);
             repair(cfg.clone(), None).unwrap();
         });
-        limits::with_test_limits(63, 1024, || {
+        limits::with_test_limits(50, 1024, || {
             assert!(LogFs::<Journal2>::open(cfg.clone()).is_err());
             assert!(repair(cfg.clone(), None).is_err());
         });
@@ -213,8 +213,8 @@ fn checkpoint_limit_includes_plaintext_budget_plus_separate_tag() {
         };
         let limit = snapshot.len() as u64;
         // The borrowed serializer must preserve the original owned wire layout.
-        let owned: index::KeyIndexV3 = crate::encoding::deserialize(&snapshot).unwrap();
-        assert_eq!(crate::encoding::serialize(&owned).unwrap(), snapshot);
+        let owned: index::KeyIndexV3 = codec::deserialize(&snapshot).unwrap();
+        assert_eq!(codec::serialize(&owned).unwrap(), snapshot);
         let before = std::fs::read(&cfg.path).unwrap();
         limits::with_test_limits(1024, limit - 1, || assert!(db.checkpoint().is_err()));
         assert_eq!(std::fs::read(&cfg.path).unwrap(), before);
@@ -289,24 +289,15 @@ fn frozen_wire_discriminants_and_layouts() {
         (LogFormatVersion::V2, 1),
         (LogFormatVersion::V3, 2),
     ] {
-        assert_eq!(
-            crate::encoding::serialize(&version).unwrap(),
-            ordinal.to_le_bytes()
-        );
+        assert_eq!(codec::serialize(&version).unwrap(), [ordinal as u8]);
     }
     for (profile, ordinal) in [
         (CryptoProfile::Standard, 0u32),
         (CryptoProfile::LowMemory, 1),
     ] {
-        assert_eq!(
-            crate::encoding::serialize(&profile).unwrap(),
-            ordinal.to_le_bytes()
-        );
+        assert_eq!(codec::serialize(&profile).unwrap(), [ordinal as u8]);
     }
-    assert_eq!(
-        crate::encoding::serialize(&CompressionFormat::Brotli).unwrap(),
-        [0; 4]
-    );
+    assert_eq!(codec::serialize(&CompressionFormat::Brotli).unwrap(), [0]);
     let index_action = || ActionIndexWrite {
         size: 0,
         hash: Sha256Hash([0; 32]),
@@ -332,14 +323,10 @@ fn frozen_wire_discriminants_and_layouts() {
         }),
         JournalAction::IndexWriteV3(index_action()),
     ];
-    for (ordinal, (action, length)) in actions
-        .into_iter()
-        .zip([53, 12, 12, 45, 20, 45])
-        .enumerate()
-    {
+    for (ordinal, (action, length)) in actions.into_iter().zip([43, 2, 2, 35, 3, 35]).enumerate() {
         let mut expected = vec![0; length];
-        expected[..4].copy_from_slice(&(ordinal as u32).to_le_bytes());
-        assert_eq!(crate::encoding::serialize(&action).unwrap(), expected);
+        expected[0] = ordinal as u8;
+        assert_eq!(codec::serialize(&action).unwrap(), expected);
     }
     let frame = V3FrameHeader {
         header: JournalEntryHeader {
@@ -352,14 +339,14 @@ fn frozen_wire_discriminants_and_layouts() {
         history: [0x22; 32],
     };
     let mut expected_frame = Vec::new();
-    expected_frame.extend_from_slice(&8192u64.to_le_bytes());
-    expected_frame.extend_from_slice(&1u64.to_le_bytes());
-    expected_frame.extend_from_slice(&77u32.to_le_bytes());
-    expected_frame.extend_from_slice(&0u32.to_le_bytes());
+    expected_frame.extend_from_slice(&[0x80, 0x40]);
+    expected_frame.push(1);
+    expected_frame.push(77);
+    expected_frame.push(0);
     expected_frame.extend_from_slice(&[0x11; 32]);
     expected_frame.extend_from_slice(&[0x22; 32]);
-    assert_eq!(crate::encoding::serialize(&frame).unwrap(), expected_frame);
-    assert_eq!(expected_frame.len(), 88);
+    assert_eq!(codec::serialize(&frame).unwrap(), expected_frame);
+    assert_eq!(expected_frame.len(), 69);
 
     let payload = root::V3RootPayload {
         magic: V3_INNER_MAGIC,
@@ -381,20 +368,47 @@ fn frozen_wire_discriminants_and_layouts() {
         checkpoint_history: [0; 32],
     };
     let mut expected = b"LOGFS-OPAQUE-V3\0".to_vec();
-    expected.extend_from_slice(&3u32.to_le_bytes());
-    expected.extend_from_slice(&1u32.to_le_bytes());
+    expected.push(3);
+    expected.push(1);
     expected.extend_from_slice(&[0x33; 16]);
     expected.push(0);
-    expected.extend_from_slice(&2u64.to_le_bytes());
-    expected.extend_from_slice(&2u32.to_le_bytes());
-    expected.extend_from_slice(&0u32.to_le_bytes());
-    expected.extend_from_slice(&0u64.to_le_bytes());
-    expected.extend_from_slice(&8192u64.to_le_bytes());
+    expected.push(2);
+    expected.push(2);
+    expected.push(0);
+    expected.push(0);
+    expected.extend_from_slice(&[0x80, 0x40]);
     expected.push(0);
     expected.extend_from_slice(&[0x44; 32]);
     expected.extend_from_slice(&[0x55; 16]);
     expected.extend_from_slice(&[0x66; 16]);
     expected.extend_from_slice(&[0; 64]);
-    assert_eq!(crate::encoding::serialize(&payload).unwrap(), expected);
-    assert_eq!(expected.len(), 202);
+    assert_eq!(codec::serialize(&payload).unwrap(), expected);
+    assert_eq!(expected.len(), 170);
+}
+
+#[test]
+fn postcard_payloads_are_length_bounded_and_exact() {
+    let encoded = codec::serialize(&data::LogFormatVersion::V3).unwrap();
+    assert!(codec::deserialize_bounded::<data::LogFormatVersion>(&encoded, 0).is_err());
+
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert!(codec::deserialize::<data::LogFormatVersion>(&trailing).is_err());
+}
+
+#[test]
+fn streaming_action_size_is_stable_across_varint_boundaries() {
+    for encrypted in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(&dir, "postcard-stream", encrypted);
+        let db = LogFs::<Journal2>::open(cfg.clone()).unwrap();
+        let value = vec![0x5a; 200];
+        let mut writer = db.insert_writer("key").unwrap();
+        writer.write_all(&value).unwrap();
+        writer.finish().unwrap();
+        drop(db);
+
+        let reopened = LogFs::<Journal2>::open(cfg).unwrap();
+        assert_eq!(reopened.get("key").unwrap(), Some(value));
+    }
 }

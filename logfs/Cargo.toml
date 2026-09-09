@@ -16,6 +16,7 @@ readme.workspace = true
 backtrace = "0.3"
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 # bincode 3.0.0 is intentionally non-buildable; 2 is the latest usable major.
+# It remains solely for reading the released v2 wire format.
 bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2", features = ["serde"] }
 brotli = "9"
@@ -25,6 +26,7 @@ fs2 = "0.4"
 hmac = "0.13"
 hkdf = "0.13"
 ring = "0.17"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 tracing = "0.1"

@@ -1,8 +1,8 @@
 # LogFS v3 byte format
 
-Status: documents the implementation as of 2026-09-09, including the v3 audit fixes. The refactor preserves existing v3 bytes and cryptographic domains. This document describes both the writer's canonical encoding and the reader's actual acceptance rules; permissive decoding is not an extension mechanism.
+Status: documents the implementation as of 2026-09-09, including the v3 audit fixes and the pre-release switch to Postcard. V3 has not been published, so development files written with the former bincode encoding are intentionally incompatible. This document describes both the writer's canonical encoding and the reader's actual acceptance rules; decoding tolerance is not an extension mechanism.
 
-Implementation map: `logfs/src/journal/v3/format.rs` (frames), `root.rs` (root envelopes and bootstrap), `index.rs` (snapshots), `limits.rs` (resource budgets), `read.rs`, `write.rs`, and `repair.rs`. Shared wire types are in `journal/data.rs`; bounded bincode decoding is in `journal/codec.rs`. Legacy root/entry decoding and checkpoint schemas/policy are in `journal/v2`. The historical public name `Journal2` is retained for API compatibility; new journals use v3.
+Implementation map: `logfs/src/journal/v3/codec.rs` (Postcard), `format.rs` (frames), `root.rs` (root envelopes and bootstrap), `index.rs` (snapshots), `limits.rs` (resource budgets), `read.rs`, `write.rs`, and `repair.rs`. Shared wire types are in `journal/data.rs`. Legacy v2 bincode decoding and checkpoint schemas/policy are isolated in `journal/codec.rs` and `journal/v2`. The historical public name `Journal2` is retained for API compatibility; new journals use v3.
 
 ## Coordinates and backing regions
 
@@ -25,21 +25,23 @@ The region base and capacity are supplied out of band; neither is a root field. 
 
 ## Primitive encoding and fixed identifiers
 
-All multibyte integers use **little endian, fixed width**, without alignment gaps. Serialization is bincode **1.3.3** with Serde, matching `bincode::serialize` and `bincode::deserialize`: little endian, fixed integers, trailing bytes allowed. Bounded decoding explicitly uses `DefaultOptions::new().with_fixint_encoding().allow_trailing_bytes().with_limit(limit)`; using `DefaultOptions` without these settings would change the format.
+Length words and integer fields explicitly described as part of an outer envelope use little-endian fixed-width encoding. Serde payloads use the stable Postcard 1.x wire format. Postcard integers larger than eight bits are unsigned varints unless a field explicitly opts into a fixed representation. V3 decoders require the declared payload to contain exactly one value and reject trailing bytes.
 
 | Rust/wire concept | Encoding |
 | --- | --- |
-| `u8`, `u32`, `u64` | 1, 4, 8 bytes respectively |
-| SequenceId / NonZeroU64 | 8-byte u64, zero invalid |
-| Enum variant | 4-byte **zero-based declaration ordinal**, then variant fields |
+| `u8` | One byte |
+| `u32`, `u64` | Unsigned Postcard varint unless explicitly fixed |
+| `KeyMeta.size` | Fixed 8-byte little-endian u64, so streaming reservation and finalization have identical size |
+| SequenceId / NonZeroU64 | u64 varint, zero invalid |
+| Enum variant | u32 varint containing the **zero-based declaration ordinal**, then variant fields |
 | `Option<T>` | One byte: `00` for None, `01` followed by T for Some; other tags invalid |
-| String | u64 UTF-8 byte length, followed by those bytes; valid UTF-8 required |
-| Vec | u64 element count, then consecutive element encodings |
+| String | Varint UTF-8 byte length, followed by those bytes; valid UTF-8 required |
+| Vec | Varint element count, then consecutive element encodings |
 | Fixed byte array | Exactly its array length, without a length prefix |
 | Struct / newtype | Fields in declaration order; no names, padding, or struct envelope |
-| Bitflags | Underlying u32 bits |
+| Bitflags | Underlying u32 bits encoded as a varint |
 
-The following values are frozen. Rust `repr` values do **not** override Serde enum ordinals.
+The following values are frozen. Rust `repr` values do **not** override Serde enum ordinals. All current ordinals fit in a single Postcard byte.
 
 | Enum | Discriminants |
 | --- | --- |
@@ -82,25 +84,25 @@ At body offset 0 is a u32 payload length `P`, then `P` serialized payload bytes 
 
 ### Serialized root payload
 
-Let `q = 0` when `last_index_entry` is None, and `q = 16` when it is Some. Canonical payload length is `202 + q`; canonical inner ciphertext length is `218 + q`.
+The Postcard payload has the following field order. Its offsets and total length vary with the varint values and optional checkpoint pointer.
 
-| Payload offset | Length | Field |
+| Order | Field | Encoding |
 | --- | --- | --- |
-| 0 | 16 | Magic: ASCII `LOGFS-OPAQUE-V3` followed by one zero byte |
-| 16 | 4 | Version u32 = 3 |
-| 20 | 4 | CryptoProfile ordinal |
-| 24 | 16 | Random, nonzero log identity |
-| 40 | 1 | Physical slot index |
-| 41 | 8 | Root generation |
-| 49 | 4 | Superblock format ordinal = 2 |
-| 53 | 4 | Superblock flags = 0 |
-| 57 | 8 | Active sequence; zero for an empty log |
-| 65 | 8 | Relative committed tail `T` |
-| 73 | 1 + q | Optional latest index pointer: tag, then sequence u64 and relative offset u64 |
-| 74 + q | 32 | Log secret |
-| 106 + q | 32 | Root salts: slot 0's 16 bytes, then slot 1's 16 bytes |
-| 138 + q | 32 | Committed history value |
-| 170 + q | 32 | History immediately **before** the latest checkpoint entry |
+| 1 | Magic | Fixed `[u8;16]`: ASCII `LOGFS-OPAQUE-V3` followed by one zero byte |
+| 2 | Version | u32 varint with value 3 |
+| 3 | Crypto profile | Enum ordinal varint |
+| 4 | Log identity | Random, nonzero `[u8;16]` |
+| 5 | Physical slot | u8 |
+| 6 | Root generation | u64 varint |
+| 7 | Superblock format | Enum ordinal varint; V3 = 2 |
+| 8 | Superblock flags | u32 bitflags varint; canonical value zero |
+| 9 | Active sequence | u64 varint; zero for an empty log |
+| 10 | Relative committed tail `T` | u64 varint |
+| 11 | Latest index pointer | Option tag, then sequence and relative offset as u64 varints when present |
+| 12 | Log secret | `[u8;32]` |
+| 13 | Root salts | Two consecutive `[u8;16]` values |
+| 14 | Committed history | `[u8;32]` |
+| 15 | History immediately **before** the latest checkpoint entry | `[u8;32]` |
 
 The magic's precise 16 bytes are `4c 4f 47 46 53 2d 4f 50 41 51 55 45 2d 56 33 00`.
 
@@ -158,14 +160,11 @@ scanner_overlap   = searchable_header - 1     = 295 encrypted / 311 plaintext
 
 | Offset | Length | Field |
 | --- | --- | --- |
-| 0 | 4 | Serialized frame-header length; canonical value 88 |
-| 4 | 8 | Region-relative frame offset |
-| 12 | 8 | Nonzero entry sequence |
-| 20 | 4 | Encoded action length `A + M` |
-| 24 | 4 | Entry flags; bit 0 is INCOMPLETE |
-| 28 | 32 | Previous history value |
-| 60 | 32 | This entry's history value |
-| 92 | 164 | Padding; zero in encrypted mode, random in plaintext mode |
+| 0 | 4 | Little-endian serialized frame-header length `H` |
+| 4 | H | Postcard `V3FrameHeader` |
+| 4 + H | 252 - H | Padding; zero in encrypted mode, random in plaintext mode |
+
+The serialized frame header contains, in order: region-relative frame offset as a u64 varint, nonzero sequence as a u64 varint, encoded action length `A + M` as a u32 varint, entry flags as a u32 varint, previous history `[u8;32]`, and this entry's history `[u8;32]`. Consequently `H` varies with the numeric fields.
 
 The parser requires a nonzero declared length at most 252 and a decodable header within it. Normal replay and salvage reject INCOMPLETE. Canonical committed flags are zero. Current readers retain unknown entry flag bits and ignore them; see evolution rules below. The fixed 256-byte clear header, including padding and its length field, is authenticated/checksummed as one unit.
 
@@ -184,18 +183,18 @@ For a fixed seed the XOR mapping is injective. Across entries the nonce schedule
 
 ## Actions and values
 
-Fields in the following table follow the u32 action discriminant, in the exact listed order. Nested structs add no bytes beyond their fields.
+Fields in the following table follow the varint action discriminant, in the exact listed order. Nested structs add no bytes beyond their fields.
 
 | Action | Payload fields inside the serialized action |
 | --- | --- |
-| KeyInsert (0) | size u64; chunk_size Option<u32>; whole-value SHA-256 `[u8;32]`; path String |
+| KeyInsert (0) | size fixed little-endian u64; chunk_size Option<u32 varint>; whole-value SHA-256 `[u8;32]`; path String |
 | KeyRename (1) | Vec of `(old_key String, new_key String)` |
 | KeyDelete (2) | Vec of String paths |
-| IndexWrite (3), legacy snapshot schema | size u64; snapshot hash `[u8;32]`; compression Option<CompressionFormat> |
+| IndexWrite (3), legacy snapshot schema | size u64 varint; snapshot hash `[u8;32]`; compression Option<CompressionFormat> |
 | Batch (4) | Vec of `(old_key String, new_key String)`; then Vec of deleted String paths |
-| IndexWriteV3 (5) | size u64; snapshot hash `[u8;32]`; compression Option<CompressionFormat> |
+| IndexWriteV3 (5) | size u64 varint; snapshot hash `[u8;32]`; compression Option<CompressionFormat> |
 
-An insert action is `53 + UTF8(path).len()` bytes with chunk_size None, or `57 + UTF8(path).len()` with Some. Index actions are 45 bytes without compression, 49 with Brotli. No-value rename/delete/batch actions have `D = 0`. Batch replay performs deletes first, then renames, despite the wire field order. Insert replaces the existing value at its path. Missing sources during replayed renames and missing deleted keys are tolerated by the current state application.
+Action lengths depend on Postcard varint lengths. The fixed-width insert size ensures a streaming insert's reserved action remains the same length when its final value size is written; its path and chunk size do not change during finalization. No-value rename/delete/batch actions have `D = 0`. Batch replay performs deletes first, then renames, despite the wire field order. Insert replaces the existing value at its path. Missing sources during replayed renames and missing deleted keys are tolerated by the current state application.
 
 For an insert, let `S` be plaintext value length. If chunk_size is None there is one chunk; otherwise for positive chunk size `C`, the count is `k = max(1, ceil(S/C))`. The last chunk contains the remaining bytes; all earlier chunks have exactly C bytes. Chunk identifiers are consecutive, beginning at 2. Empty v3 values have one empty chunk (and one tag in encrypted mode), unlike historical v2 empty values. No per-chunk length word is written.
 
@@ -209,16 +208,16 @@ The insert hash is SHA-256 of concatenated plaintext value bytes. Routine reads 
 
 Canonical v3 writers emit IndexWriteV3 and an **uncompressed full snapshot**. The action size field is the serialized snapshot length before encryption. Its SHA-256 is over those payload bytes (compressed bytes if a reader encounters the supported Brotli form), before encryption. The payload is one chunk at identifier 2 using the checkpoint key, with `D = size + E`.
 
-The snapshot is one Vec of entries; its initial u64 is the number of keys. Writers emit BTreeMap key order. Entries contain:
+The snapshot is one Vec of entries; it begins with a varint element count. Writers emit BTreeMap key order. Entries contain:
 
 | Order | Field | Width |
 | --- | --- | --- |
-| 1 | Key UTF-8 String | 8 + key byte length |
-| 2 | Original insert sequence | 8 |
+| 1 | Key UTF-8 String | Varint byte length + key bytes |
+| 2 | Original insert sequence | u64 varint |
 | 3 | Original entry seed, Option<[u8;24]> | 1 or 25; Some required by v3 restoration |
-| 4 | Absolute file offset of value data | 8 |
-| 5 | Plaintext value size | 8 |
-| 6 | Chunk size, Option<u32> | 1 or 5 |
+| 4 | Absolute file offset of value data | u64 varint |
+| 5 | Plaintext value size | u64 varint |
+| 6 | Chunk size, Option<u32> | Tag plus u32 varint when present |
 | 7 | Whole-value hash, Option<[u8;32]> | 1 or 33 |
 
 Writers retain the insert hash and seed. The hash remains optional on the wire; current restoration permits None and cannot invent a missing whole-value hash. Snapshot entries omit the log identity because it comes from the authenticated root. V3 snapshots contain no parent pointer.
@@ -272,25 +271,25 @@ On export, each recovered value is read with whole-value verification and encryp
 | Value/snapshot size, offsets, sequences, generation | Format fields: u64; sequence is nonzero; checked arithmetic and commit rules further restrict use |
 | Chunk size / chunk identifier | Format fields: u32; data starts at 2, so representable data count is at most `2^32 - 2` |
 | Writer chunk-count endpoint | Implementation: streaming increments its next-chunk cursor before accepting a chunk and therefore cannot use the last representable identifier; practical sizes are far below this endpoint |
-| Action plaintext/decoded serialized-byte budget | Implementation: 512 MiB = 536870912 bytes |
+| Action plaintext serialized-byte budget | Implementation: 512 MiB = 536870912 bytes |
 | Action encoded budget | Implementation: plaintext budget + 16 encrypted / +32 plaintext, additionally fitting u32 |
 | Checkpoint payload plaintext budget | Implementation: 512 MiB; encryption tag is additional |
 | Checkpoint encoded budget | Implementation: plaintext budget +16 encrypted / +0 plaintext |
-| Checkpoint decoded byte budget | Implementation: minimum of 512 MiB and committed region length; enforced during Brotli expansion and bounded deserialization |
+| Checkpoint decompressed serialized-byte budget | Implementation: minimum of 512 MiB and committed region length; enforced during Brotli expansion and before Postcard deserialization |
 | Value size/allocation | No 512 MiB metadata cap on values; physical region, u64/chunk arithmetic, usize/address space, and available memory apply. Whole-value reads allocate the whole value; streaming avoids that allocation |
 
-Writers measure actions/snapshots before serialization, enforce the shared plaintext budget, and include encoded overhead in capacity preflight. The snapshot encoder traverses borrowed keys rather than allocating a cloned key collection. Readers validate encoded lengths before read-buffer allocation and apply decoded limits after authentication/decompression. Test-only thread-local limits exercise these same paths with small fixtures; production limits are not configurable through that mechanism.
+Writers measure actions/snapshots before serialization, enforce the shared plaintext budget, and include encoded overhead in capacity preflight. The snapshot encoder traverses borrowed keys rather than allocating a cloned key collection. Readers validate encoded lengths before read-buffer allocation and apply decompressed serialized-byte limits after authentication/decompression. Postcard additionally constrains collection preallocation by the remaining input, but the byte limit is not an aggregate memory or work budget. Test-only thread-local limits exercise these same paths with small fixtures; production limits are not configurable through that mechanism.
 
 Byte limits are not total-memory budgets: serialized buffers, decrypted buffers, strings, tree nodes, and temporary copies can coexist. No aggregate allocator budget or parser fuzzing guarantee is implied. Legacy-v2 budgets retain their prior behavior independently of v3's corrected overhead accounting.
 
 ## Compatibility and evolution rules
 
-1. Preserve field order, widths, endianness, enum ordinals, option/vector encoding, hash inputs, KDF parameters, key labels, and nonce/AAD rules for v3. Golden byte-layout assertions in `v3/tests.rs` pin root payloads, frame headers, action forms, and discriminants. Do not change bytes by replacing Serde-derived representations without byte-for-byte fixtures.
+1. Preserve field order, explicit fixed-width adapters, enum ordinals, Postcard representations, hash inputs, KDF parameters, key labels, and nonce/AAD rules for v3. Golden byte-layout assertions in `v3/tests.rs` pin root payloads, frame headers, action forms, and discriminants. Do not change Serde-derived representations without updating the format version and byte fixtures.
 2. Root payload version must be exactly 3 and its Superblock enum must be V3. Unknown enum ordinals fail deserialization. There is no required/optional feature bitmap, extension directory, generic unknown-record skip rule, or negotiated minor version.
 3. Canonical root flags are zero, and unknown root bits are rejected. Canonical entry flags are zero for committed entries; current readers reject INCOMPLETE but retain/ignore other bits. Consequently, an unknown entry flag cannot safely signal a new required semantic to old readers.
-4. Bincode trailing bytes inside a declared payload are accepted; padding is authenticated. This tolerance does **not** mean old readers understand appended fields, preserve them on rewrite, or can safely execute changed actions. Root/frame length prefixes permit bounded parsing, not arbitrary future semantics.
+4. Postcard payloads must consume their complete declared byte range; trailing bytes are rejected. Outer root/frame padding remains outside the declared payload and is authenticated/checksummed. Root/frame length prefixes permit bounded parsing, not arbitrary future semantics.
 5. Changes that require different interpretation, introduce mandatory fields/records/features, change coordinate rules or cryptography, or alter mutation semantics need an explicitly designed new version and migration. A future optional extension must first define old-reader behavior, authentication coverage, size limits, and rewrite retention. Do not retrofit such a contract by silently reusing v3 reserved bytes.
 6. Named KDF profiles are immutable. New encrypted-profile identifiers require out-of-band selection and authenticated validation; existing readers are not required to try unbounded profile parameters.
 7. Legacy v2 remains readable/exportable/migratable and read-only through the current API. V3 creation does not rewrite an existing v2 region in place. Migration/export creates a fresh v3 destination. Public Rust names such as Journal2 and Superblock are not disk-version negotiation signals.
 
-Representative complete-file encrypted golden fixtures, an independent decoder, sustained fuzzing, and total-allocation budgets remain separate follow-up work; the byte-level assertions and corruption/regression suite are the current executable compatibility checks.
+Representative complete-file encrypted golden fixtures, an independent decoder, sustained fuzzing, and total-allocation budgets remain separate follow-up work; the byte-level assertions and corruption/regression suite are the current executable compatibility checks. Development v3 files created before the Postcard switch are not supported because v3 was not yet published.

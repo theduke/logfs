@@ -1,7 +1,7 @@
 //! Frozen legacy root and entry decoding used by open, export, and migration.
 use super::data::{self, Offset};
 use crate::journal::codec::{
-    ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, MAX_ACTION_BYTES, deserialize_bounded,
+    ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, MAX_ACTION_BYTES, deserialize_legacy_bounded,
 };
 use crate::journal::v3::{IndexedSuperBlock, RootFormat};
 use crate::{LogFsError, crypto::Crypto, journal::SequenceId};
@@ -122,7 +122,7 @@ pub(in crate::journal) fn read_entry_action(
         buffer
     };
 
-    let action: data::JournalAction = deserialize_bounded(action_data, MAX_ACTION_BYTES)?;
+    let action: data::JournalAction = deserialize_legacy_bounded(action_data, MAX_ACTION_BYTES)?;
     Ok(action)
 }
 

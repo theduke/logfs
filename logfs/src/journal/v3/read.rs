@@ -404,7 +404,11 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
         } else {
             super::MAX_ACTION_BYTES
         };
-        let action: data::JournalAction = super::deserialize_bounded(action_data, action_limit)?;
+        let action: data::JournalAction = if self.v3_entries {
+            super::codec::deserialize_bounded(action_data, action_limit)?
+        } else {
+            crate::journal::codec::deserialize_legacy_bounded(action_data, action_limit)?
+        };
         if let Some(frame) = &frame_history {
             let actual = super::v3_history_commit(
                 self.v3_crypto.as_ref(),

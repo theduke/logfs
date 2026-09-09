@@ -1,10 +1,8 @@
 //! Full v3 snapshots. The borrowed encoder avoids cloning the entire keyspace.
 use super::data::{ByteCountU32, ByteCountU64, EntryPointer, KeyPath, Sha256Hash};
-use super::{data, limits, read, root::v3_entry_start};
+use super::{codec, data, limits, read, root::v3_entry_start};
 use crate::Path;
-use crate::journal::codec::{
-    ENTRY_FIRST_DATA_CHUNK, MAX_CHECKPOINT_DECODED_BYTES, deserialize_bounded,
-};
+use crate::journal::codec::{ENTRY_FIRST_DATA_CHUNK, MAX_CHECKPOINT_DECODED_BYTES};
 use crate::{DataOffset, journal::SequenceId};
 use crate::{LogFsError, state::KeyPointer};
 use serde::{Serialize, ser::SerializeSeq};
@@ -35,7 +33,7 @@ struct Snapshot<'a>(&'a BTreeMap<String, KeyPointer>);
 
 impl Serialize for Snapshot<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Bincode structs have no envelope: the single Vec field in KeyIndexV3
+        // Postcard structs have no envelope: the single Vec field in KeyIndexV3
         // is encoded identically to this sequence. Field order below is frozen.
         #[derive(Serialize)]
         struct Entry<'a> {
@@ -68,7 +66,7 @@ pub(super) fn serialize_snapshot(
     encrypted: bool,
 ) -> Result<Vec<u8>, LogFsError> {
     let snapshot = Snapshot(tree);
-    let size = crate::encoding::serialized_size(&snapshot)?;
+    let size = codec::serialized_size(&snapshot)?;
     super::limits::checkpoint().encoded_len(
         size,
         if encrypted {
@@ -77,7 +75,7 @@ pub(super) fn serialize_snapshot(
             0
         },
     )?;
-    Ok(crate::encoding::serialize(&snapshot)?)
+    codec::serialize(&snapshot)
 }
 
 pub(in crate::journal) fn validate_restored_pointer<R: io::Read + io::Seek>(
@@ -243,7 +241,7 @@ pub(super) fn restore_index<R: io::Read + io::Seek>(
                 } else {
                     Cow::Borrowed(data)
                 };
-                let index: KeyIndexV3 = deserialize_bounded(&decoded, max_decoded_len)?;
+                let index: KeyIndexV3 = codec::deserialize_bounded(&decoded, max_decoded_len)?;
                 prev_pointer = None;
                 for item in index.keys {
                     validate_restored_pointer(

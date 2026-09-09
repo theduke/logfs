@@ -5,7 +5,7 @@ use crate::LogFsError;
 pub(super) const MAX_CHECKPOINT_DECODED_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const MAX_ACTION_BYTES: usize = 512 * 1024 * 1024;
 
-pub(super) fn deserialize_bounded<T: serde::de::DeserializeOwned>(
+pub(super) fn deserialize_legacy_bounded<T: serde::de::DeserializeOwned>(
     bytes: &[u8],
     limit: usize,
 ) -> Result<T, LogFsError> {

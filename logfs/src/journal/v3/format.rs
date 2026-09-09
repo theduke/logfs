@@ -1,8 +1,7 @@
 //! V3 byte framing, authentication domains, and recovery decoding.
 use super::{
-    ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK,
+    ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, codec,
     data::{self, Offset},
-    deserialize_bounded,
 };
 use crate::{LogFsError, crypto::Crypto, journal::SequenceId};
 use sha2::Digest;
@@ -67,7 +66,7 @@ pub(super) fn decode_v3_frame_header(bytes: &[u8]) -> Result<V3FrameHeader, LogF
     if encoded_len == 0 || encoded_len > bytes.len().saturating_sub(4) {
         return Err(LogFsError::new_internal("Invalid v3 frame header length"));
     }
-    Ok(crate::encoding::deserialize(&bytes[4..4 + encoded_len])?)
+    codec::deserialize(&bytes[4..4 + encoded_len])
 }
 
 pub(super) fn v3_history_commit(
@@ -257,5 +256,5 @@ pub(super) fn read_entry_action_with_domain(
     } else {
         verify_plain_metadata_checksum(buffer, &aad)?
     };
-    deserialize_bounded(bytes, super::limits::action().plaintext as usize)
+    codec::deserialize_bounded(bytes, super::limits::action().plaintext as usize)
 }

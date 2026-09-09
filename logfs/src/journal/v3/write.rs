@@ -520,7 +520,7 @@ impl LogWriter {
                 "Chunk size must be greater than zero",
             ));
         }
-        let action_plain_len = crate::encoding::serialized_size(&action)?;
+        let action_plain_len = super::codec::serialized_size(&action)?;
         if self.is_legacy_v2() {
             return Err(LogFsError::ReadOnly);
         }
@@ -611,11 +611,11 @@ impl LogWriter {
         let entry_offset = self.offset - self.base_offset;
 
         super::frame_len(
-            crate::encoding::serialized_size(action)?,
+            super::codec::serialized_size(action)?,
             0,
             self.crypto.is_some(),
         )?;
-        let action_plain = crate::encoding::serialize(&action)?;
+        let action_plain = super::codec::serialize(&action)?;
         let mut action_data = action_plain.clone();
         if let Some(identity) = self.v3_identity() {
             let entry_nonce = self
@@ -665,7 +665,7 @@ impl LogWriter {
                 &action_plain,
             );
             next_history = Some((previous_history, history));
-            let encoded = crate::encoding::serialize(&super::V3FrameHeader {
+            let encoded = super::codec::serialize(&super::V3FrameHeader {
                 header: header.clone(),
                 previous_history,
                 history,
@@ -749,7 +749,7 @@ impl LogWriter {
         let reserved = self.preflight_stream_action(action)?;
         self.prepare_entry_nonce()?;
 
-        let action_size = crate::encoding::serialized_size(action)? + self.metadata_padding();
+        let action_size = super::codec::serialized_size(action)? + self.metadata_padding();
         let header = data::JournalEntryHeader {
             offset: self.offset - self.base_offset,
             sequence_id: self.next_sequence,
@@ -773,7 +773,7 @@ impl LogWriter {
             return Err(LogFsError::ReadOnly);
         }
         let reserved = super::frame_len(
-            crate::encoding::serialized_size(action)?,
+            super::codec::serialized_size(action)?,
             0,
             self.crypto.is_some(),
         )?;

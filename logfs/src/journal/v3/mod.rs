@@ -1,9 +1,13 @@
 //! Current journal implementation. Legacy decoding is delegated to `v2`.
+mod codec;
 mod format;
 pub(super) mod index;
 mod limits;
 mod root;
-use super::codec::*;
+use super::codec::{
+    ENTRY_ACTION_CHUNK, ENTRY_FIRST_DATA_CHUNK, ENTRY_HEADER_CHUNK, MAX_ACTION_BYTES,
+    MAX_CHECKPOINT_DECODED_BYTES,
+};
 #[cfg(test)]
 pub(crate) use format::V3_HEADER_SIZE;
 use format::*;
