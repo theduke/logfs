@@ -90,7 +90,7 @@ fn decode_root(
             None,
         )
     };
-    let payload: V3RootPayload = bincode::deserialize(&payload_bytes)?;
+    let payload: V3RootPayload = crate::encoding::deserialize(&payload_bytes)?;
     if payload.magic != V3_INNER_MAGIC
         || payload.version != 3
         || payload.block.format_version != data::LogFormatVersion::V3
@@ -217,7 +217,7 @@ pub(super) fn encode_root(
     else {
         return Err(LogFsError::ReadOnly);
     };
-    let payload = zeroize::Zeroizing::new(bincode::serialize(&V3RootPayload {
+    let payload = zeroize::Zeroizing::new(crate::encoding::serialize(&V3RootPayload {
         magic: V3_INNER_MAGIC,
         version: 3,
         profile: crypto.map(Crypto::profile).unwrap_or_default(),

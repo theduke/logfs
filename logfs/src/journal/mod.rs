@@ -2,6 +2,7 @@ mod codec;
 pub(crate) mod data;
 pub mod v2;
 pub mod v3;
+pub use data::LogFormatVersion;
 pub use v2::{Journal2, Superblock};
 
 use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf, sync::Arc};

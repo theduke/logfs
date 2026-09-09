@@ -26,7 +26,7 @@ use std::{
 use sha2::Digest;
 
 use crate::{
-    KeyLock, LogConfig, LogFsError,
+    KeyLock, LogConfig, LogFsError, LogOpenOptions,
     crypto::Crypto,
     state::{KeyPointer, SharedTree},
 };
@@ -37,6 +37,19 @@ use super::RepairConfig;
 
 pub(crate) use super::data;
 pub use data::Superblock;
+
+fn require_creatable_format(
+    format_version: Option<data::LogFormatVersion>,
+) -> Result<(), LogFsError> {
+    if let Some(version) = format_version
+        && version != data::LogFormatVersion::V3
+    {
+        return Err(LogFsError::new_internal(format!(
+            "Cannot create log format {version:?}; only V3 creation is supported"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct PersistedEntry {
@@ -158,7 +171,7 @@ impl Journal2 {
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError> {
-        Self::open_with_region(path, tree, crypto, config, None, false)
+        Self::open_with_region(path, tree, crypto, config, LogOpenOptions::default())
     }
 
     pub(crate) fn create_new_exclusive(
@@ -166,9 +179,9 @@ impl Journal2 {
         _tree: SharedTree,
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
-        region_len: Option<u64>,
-        randomize_region: bool,
+        options: LogOpenOptions,
     ) -> Result<Self, LogFsError> {
+        require_creatable_format(options.format_version)?;
         if config.readonly {
             return Err(LogFsError::ReadOnly);
         }
@@ -206,8 +219,8 @@ impl Journal2 {
             file,
             config.offset.unwrap_or_default(),
             durable.clone(),
-            region_len,
-            randomize_region,
+            options.region_len,
+            options.randomize_region,
         )?;
         let backing = Arc::new(read::BackingFile::new(writer.backing_clone()?));
         let v3_crypto = writer.v3_crypto().map(Arc::new);
@@ -235,8 +248,7 @@ impl Journal2 {
         tree: SharedTree,
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
-        region_len: Option<u64>,
-        randomize_region: bool,
+        options: LogOpenOptions,
     ) -> Result<Self, LogFsError> {
         if config.default_chunk_size == 0 {
             return Err(LogFsError::new_internal(
@@ -312,6 +324,7 @@ impl Journal2 {
                         "File is empty at the specified offset - but allow_create is false",
                     ));
                 }
+                require_creatable_format(options.format_version)?;
 
                 LogWriter::create_new(
                     crypto.clone(),
@@ -319,11 +332,11 @@ impl Journal2 {
                     file,
                     config.offset.unwrap_or_default(),
                     durable.clone(),
-                    region_len,
-                    randomize_region,
+                    options.region_len,
+                    options.randomize_region,
                 )?
             } else {
-                if randomize_region {
+                if options.randomize_region {
                     return Err(LogFsError::new_internal(
                         "Randomized preallocation is only valid while initializing an empty region",
                     ));
@@ -337,7 +350,7 @@ impl Journal2 {
                     config.offset.unwrap_or_default(),
                     &tainted,
                     durable.clone(),
-                    region_len,
+                    options,
                 )?
             }
         } else {
@@ -348,6 +361,7 @@ impl Journal2 {
                     LogFsError::new_internal("Database does not exist and creation is disabled")
                 });
             }
+            require_creatable_format(options.format_version)?;
             let mut file = std::fs::OpenOptions::new()
                 .create_new(true)
                 .read(true)
@@ -367,8 +381,8 @@ impl Journal2 {
                 file,
                 config.offset.unwrap_or_default(),
                 durable.clone(),
-                region_len,
-                randomize_region,
+                options.region_len,
+                options.randomize_region,
             )?
         };
         let readonly = config.readonly || writer.is_legacy_v2();
@@ -406,7 +420,7 @@ impl Journal2 {
         base_offset: u64,
         tainted: &write::TaintedFlag,
         durable: Arc<std::sync::atomic::AtomicBool>,
-        region_len: Option<u64>,
+        options: LogOpenOptions,
     ) -> Result<LogWriter, LogFsError> {
         let meta = file.metadata()?;
         let file_size = meta.len();
@@ -416,7 +430,18 @@ impl Journal2 {
         let mut reader =
             read::LogReader::new_start(file, base_offset, crypto.as_ref().map(|x| &**x));
         let superblock = reader.read_superblocks()?;
-        if region_len.is_some_and(|length| superblock.block.tail_offset > length) {
+        if let Some(expected) = options.format_version
+            && expected != superblock.block.format_version
+        {
+            return Err(LogFsError::new_internal(format!(
+                "Log format mismatch: requested {expected:?}, found {:?}",
+                superblock.block.format_version
+            )));
+        }
+        if options
+            .region_len
+            .is_some_and(|length| superblock.block.tail_offset > length)
+        {
             return Err(LogFsError::new_internal(
                 "Committed log tail exceeds configured region",
             ));
@@ -477,7 +502,7 @@ impl Journal2 {
             base_offset,
             superblock,
             durable,
-            region_len,
+            options.region_len,
         )?;
         Ok(writer)
     }

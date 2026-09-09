@@ -35,7 +35,7 @@ pub(in crate::journal) fn find_entry_header_in_slice(
                     }
                 };
 
-            match bincode::deserialize::<data::JournalEntryHeader>(decrypted) {
+            match crate::encoding::deserialize::<data::JournalEntryHeader>(decrypted) {
                 Ok(header)
                     if header.sequence_id == sequence
                         && !header
@@ -56,7 +56,7 @@ pub(in crate::journal) fn find_entry_header_in_slice(
     } else {
         for index in 0..=(data.len() - header_len) {
             let slice = &data[index..index + header_len];
-            if let Ok(header) = bincode::deserialize::<data::JournalEntryHeader>(slice)
+            if let Ok(header) = crate::encoding::deserialize::<data::JournalEntryHeader>(slice)
                 && header.sequence_id == sequence
                 && !header
                     .flags
@@ -93,7 +93,7 @@ pub(in crate::journal) fn read_entry_header(
         buffer
     };
 
-    let header: data::JournalEntryHeader = bincode::deserialize(data)?;
+    let header: data::JournalEntryHeader = crate::encoding::deserialize(data)?;
     Ok(header)
 }
 
@@ -164,7 +164,7 @@ pub(in crate::journal) fn read_roots<R: Read + Seek>(
                 Err(_) => continue,
             };
         }
-        let Ok(candidate) = bincode::deserialize::<data::Superblock>(&raw) else {
+        let Ok(candidate) = crate::encoding::deserialize::<data::Superblock>(&raw) else {
             continue;
         };
         if candidate.format_version != data::LogFormatVersion::V2 {

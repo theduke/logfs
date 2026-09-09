@@ -91,6 +91,20 @@ before EOF.
 Checkpoint payloads are capped at 512 MiB of decoded working memory, and journal
 actions at 512 MiB, to reject corrupt length fields before unbounded allocation.
 
+## Objstore backend
+
+The `objstore_logfs` workspace crate provides a LogFS backend for `objstore`.
+Its URI accepts an optional on-disk format constraint and a byte offset, for
+example:
+
+```text
+logfs:///absolute/path/to/archive.log?version=3&offset=4096
+```
+
+`version` may be `2` or `3` when opening an existing log; new logs can only be
+created as version 3. If `version` is omitted, the format is auto-detected.
+`offset` selects the start of the LogFS region within the backing file.
+
 ## Performance harness
 
 `cargo bench -p logfs --bench reliability --locked` covers 10,000 small writes,

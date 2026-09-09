@@ -1,5 +1,6 @@
 mod error;
-pub use self::error::LogFsError;
+pub use self::error::{LogFsError, SerializationError};
+mod encoding;
 
 mod journal;
 mod state;
@@ -10,7 +11,7 @@ pub use journal::v2::{
     read::{KeyChunkIter, StdKeyReader},
     write::KeyWriter,
 };
-pub use journal::{Journal2, JournalStore, Superblock};
+pub use journal::{Journal2, JournalStore, LogFormatVersion, Superblock};
 
 mod crypto;
 #[doc(hidden)]
@@ -51,6 +52,9 @@ pub struct LogOpenOptions {
     /// unwritten capacity but requires `region_len` and performs a full-region
     /// write. It is never applied while opening an existing log.
     pub randomize_region: bool,
+    /// Require an existing log to use this on-disk format. New logs currently
+    /// support only [`LogFormatVersion::V3`].
+    pub format_version: Option<LogFormatVersion>,
 }
 
 /// Controls optional whole-value hash checking during routine reads. Hashes are
@@ -704,14 +708,8 @@ impl LogFs<Journal2> {
             .map(|value| Arc::new(crypto::Crypto::new(value)));
         let state = Arc::new(RwLock::new(state::State::new()));
         let path = config.path.clone();
-        let journal = Journal2::create_new_exclusive(
-            path.clone(),
-            state.clone(),
-            crypto,
-            &config,
-            options.region_len,
-            options.randomize_region,
-        )?;
+        let journal =
+            Journal2::create_new_exclusive(path.clone(), state.clone(), crypto, &config, options)?;
         journal.set_durable(options.durable)?;
         if options.durable {
             journal.sync()?;
@@ -775,14 +773,8 @@ impl LogFs<Journal2> {
             .map(|value| Arc::new(crypto::Crypto::new(value)));
         let state = Arc::new(RwLock::new(state::State::new()));
         let path = config.path.clone();
-        let journal = Journal2::open_with_region(
-            path.clone(),
-            state.clone(),
-            crypto,
-            &config,
-            options.region_len,
-            options.randomize_region,
-        )?;
+        let journal =
+            Journal2::open_with_region(path.clone(), state.clone(), crypto, &config, options)?;
         journal.set_durable(options.durable)?;
         if options.durable {
             journal.sync()?;
@@ -898,7 +890,7 @@ mod tests {
                 path: "legacy".into(),
             },
         });
-        let mut action_bytes = bincode::serialize(&action).unwrap();
+        let mut action_bytes = crate::encoding::serialize(&action).unwrap();
         if let Some(crypto) = &crypto {
             crypto.encrypt_data(1, 1, &mut action_bytes).unwrap();
         }
@@ -908,7 +900,7 @@ mod tests {
             action_size: action_bytes.len() as u32,
             flags: JournalEntryHeaderFlags::empty(),
         };
-        let mut header_bytes = bincode::serialize(&header).unwrap();
+        let mut header_bytes = crate::encoding::serialize(&header).unwrap();
         if let Some(crypto) = &crypto {
             crypto.encrypt_data(1, 0, &mut header_bytes).unwrap();
         }
@@ -938,7 +930,7 @@ mod tests {
         file.seek(std::io::SeekFrom::Start(base_offset)).unwrap();
         for slot in 0..crate::journal::v2::data::Superblock::HEADER_COUNT {
             let padding = crypto.as_ref().map(|_| 16).unwrap_or(0);
-            let mut bytes = bincode::serialize(&root).unwrap();
+            let mut bytes = crate::encoding::serialize(&root).unwrap();
             bytes.resize(
                 crate::journal::v2::data::Superblock::SERIALIZED_LEN as usize - padding,
                 0,
@@ -997,7 +989,24 @@ mod tests {
         );
         config.allow_create = false;
         config.readonly = true;
-        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+        assert!(
+            LogFs::<Journal2>::open_with_options(
+                config.clone(),
+                LogOpenOptions {
+                    format_version: Some(LogFormatVersion::V3),
+                    ..LogOpenOptions::default()
+                },
+            )
+            .is_err()
+        );
+        let db = LogFs::<Journal2>::open_with_options(
+            config.clone(),
+            LogOpenOptions {
+                format_version: Some(LogFormatVersion::V2),
+                ..LogOpenOptions::default()
+            },
+        )
+        .unwrap();
         assert_eq!(db.get("legacy").unwrap(), Some(expected));
     }
 
@@ -1037,6 +1046,21 @@ mod tests {
         std::fs::write(&config.path, sentinel).unwrap();
         assert!(LogFs::<Journal2>::create_new_durable(config.clone()).is_err());
         assert_eq!(std::fs::read(config.path).unwrap(), sentinel);
+    }
+
+    #[test]
+    fn requested_legacy_format_does_not_create_a_new_log() {
+        let config = test_config("version-constrained-create");
+        let result = LogFs::<Journal2>::open_with_options(
+            config.clone(),
+            LogOpenOptions {
+                format_version: Some(LogFormatVersion::V2),
+                ..LogOpenOptions::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!config.path.exists());
     }
 
     #[test]
@@ -1435,6 +1459,7 @@ mod tests {
                     region_len: None,
                     durable: true,
                     randomize_region: false,
+                    format_version: None,
                 },
             )
             .unwrap();
@@ -1470,6 +1495,7 @@ mod tests {
                     region_len: None,
                     durable: true,
                     randomize_region: false,
+                    format_version: None,
                 },
             )
             .unwrap();
@@ -1526,6 +1552,7 @@ mod tests {
                 region_len: Some(region_len),
                 durable: false,
                 randomize_region: false,
+                format_version: None,
             },
         )
         .unwrap();
@@ -1540,6 +1567,7 @@ mod tests {
                 region_len: Some(region_len),
                 durable: false,
                 randomize_region: false,
+                format_version: None,
             },
         )
         .unwrap();
@@ -1582,6 +1610,7 @@ mod tests {
                 region_len: Some(region_len),
                 durable: false,
                 randomize_region: false,
+                format_version: None,
             },
         )
         .unwrap();
@@ -2280,6 +2309,7 @@ mod tests {
                 region_len: Some(region_len),
                 durable: false,
                 randomize_region: true,
+                format_version: None,
             },
         )
         .unwrap();
@@ -2299,6 +2329,7 @@ mod tests {
                 region_len: Some(region_len),
                 durable: false,
                 randomize_region: false,
+                format_version: None,
             },
         )
         .unwrap();

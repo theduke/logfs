@@ -67,7 +67,7 @@ pub(super) fn decode_v3_frame_header(bytes: &[u8]) -> Result<V3FrameHeader, LogF
     if encoded_len == 0 || encoded_len > bytes.len().saturating_sub(4) {
         return Err(LogFsError::new_internal("Invalid v3 frame header length"));
     }
-    Ok(bincode::deserialize(&bytes[4..4 + encoded_len])?)
+    Ok(crate::encoding::deserialize(&bytes[4..4 + encoded_len])?)
 }
 
 pub(super) fn v3_history_commit(

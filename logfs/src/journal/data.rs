@@ -303,7 +303,7 @@ mod tests {
             action_size: 0,
             flags: JournalEntryHeaderFlags::empty(),
         };
-        let code = bincode::serialize(&header).unwrap();
+        let code = crate::encoding::serialize(&header).unwrap();
         assert_eq!(code.len(), JournalEntryHeader::SERIALIZED_LEN);
     }
 }

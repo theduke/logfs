@@ -68,7 +68,7 @@ pub(super) fn serialize_snapshot(
     encrypted: bool,
 ) -> Result<Vec<u8>, LogFsError> {
     let snapshot = Snapshot(tree);
-    let size = bincode::serialized_size(&snapshot)?;
+    let size = crate::encoding::serialized_size(&snapshot)?;
     super::limits::checkpoint().encoded_len(
         size,
         if encrypted {
@@ -77,7 +77,7 @@ pub(super) fn serialize_snapshot(
             0
         },
     )?;
-    Ok(bincode::serialize(&snapshot)?)
+    Ok(crate::encoding::serialize(&snapshot)?)
 }
 
 pub(in crate::journal) fn validate_restored_pointer<R: io::Read + io::Seek>(

@@ -213,8 +213,8 @@ fn checkpoint_limit_includes_plaintext_budget_plus_separate_tag() {
         };
         let limit = snapshot.len() as u64;
         // The borrowed serializer must preserve the original owned wire layout.
-        let owned: index::KeyIndexV3 = bincode::deserialize(&snapshot).unwrap();
-        assert_eq!(bincode::serialize(&owned).unwrap(), snapshot);
+        let owned: index::KeyIndexV3 = crate::encoding::deserialize(&snapshot).unwrap();
+        assert_eq!(crate::encoding::serialize(&owned).unwrap(), snapshot);
         let before = std::fs::read(&cfg.path).unwrap();
         limits::with_test_limits(1024, limit - 1, || assert!(db.checkpoint().is_err()));
         assert_eq!(std::fs::read(&cfg.path).unwrap(), before);
@@ -289,16 +289,22 @@ fn frozen_wire_discriminants_and_layouts() {
         (LogFormatVersion::V2, 1),
         (LogFormatVersion::V3, 2),
     ] {
-        assert_eq!(bincode::serialize(&version).unwrap(), ordinal.to_le_bytes());
+        assert_eq!(
+            crate::encoding::serialize(&version).unwrap(),
+            ordinal.to_le_bytes()
+        );
     }
     for (profile, ordinal) in [
         (CryptoProfile::Standard, 0u32),
         (CryptoProfile::LowMemory, 1),
     ] {
-        assert_eq!(bincode::serialize(&profile).unwrap(), ordinal.to_le_bytes());
+        assert_eq!(
+            crate::encoding::serialize(&profile).unwrap(),
+            ordinal.to_le_bytes()
+        );
     }
     assert_eq!(
-        bincode::serialize(&CompressionFormat::Brotli).unwrap(),
+        crate::encoding::serialize(&CompressionFormat::Brotli).unwrap(),
         [0; 4]
     );
     let index_action = || ActionIndexWrite {
@@ -333,7 +339,7 @@ fn frozen_wire_discriminants_and_layouts() {
     {
         let mut expected = vec![0; length];
         expected[..4].copy_from_slice(&(ordinal as u32).to_le_bytes());
-        assert_eq!(bincode::serialize(&action).unwrap(), expected);
+        assert_eq!(crate::encoding::serialize(&action).unwrap(), expected);
     }
     let frame = V3FrameHeader {
         header: JournalEntryHeader {
@@ -352,7 +358,7 @@ fn frozen_wire_discriminants_and_layouts() {
     expected_frame.extend_from_slice(&0u32.to_le_bytes());
     expected_frame.extend_from_slice(&[0x11; 32]);
     expected_frame.extend_from_slice(&[0x22; 32]);
-    assert_eq!(bincode::serialize(&frame).unwrap(), expected_frame);
+    assert_eq!(crate::encoding::serialize(&frame).unwrap(), expected_frame);
     assert_eq!(expected_frame.len(), 88);
 
     let payload = root::V3RootPayload {
@@ -389,6 +395,6 @@ fn frozen_wire_discriminants_and_layouts() {
     expected.extend_from_slice(&[0x55; 16]);
     expected.extend_from_slice(&[0x66; 16]);
     expected.extend_from_slice(&[0; 64]);
-    assert_eq!(bincode::serialize(&payload).unwrap(), expected);
+    assert_eq!(crate::encoding::serialize(&payload).unwrap(), expected);
     assert_eq!(expected.len(), 202);
 }

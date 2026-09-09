@@ -12,7 +12,7 @@ pub enum LogFsError {
         error: std::io::Error,
         backtrace: backtrace::Backtrace,
     },
-    Conversion(bincode::Error),
+    Conversion(SerializationError),
     Tainted,
     WriterClosed,
 }
@@ -78,8 +78,31 @@ impl From<std::io::Error> for LogFsError {
     }
 }
 
-impl From<bincode::Error> for LogFsError {
-    fn from(err: bincode::Error) -> Self {
-        Self::Conversion(err)
+#[derive(Debug)]
+pub enum SerializationError {
+    Encode(bincode::error::EncodeError),
+    Decode(bincode::error::DecodeError),
+}
+
+impl std::fmt::Display for SerializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Encode(error) => error.fmt(f),
+            Self::Decode(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SerializationError {}
+
+impl From<bincode::error::EncodeError> for LogFsError {
+    fn from(error: bincode::error::EncodeError) -> Self {
+        Self::Conversion(SerializationError::Encode(error))
+    }
+}
+
+impl From<bincode::error::DecodeError> for LogFsError {
+    fn from(error: bincode::error::DecodeError) -> Self {
+        Self::Conversion(SerializationError::Decode(error))
     }
 }

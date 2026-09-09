@@ -1,0 +1,38 @@
+[package]
+name = "objstore_logfs"
+version.workspace = true
+authors.workspace = true
+readme.workspace = true
+description = "logfs backend for objstore"
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+objstore = "0.1.0-alpha.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+url = "2"
+
+logfs = { path = "../logfs", version = "0.2" }
+base64 = "0.23"
+zeroize = "1"
+
+# time crate used for filling in timestamps when backend doesn't provide them
+time = { version = "0.3", features = ["formatting", "parsing"] }
+
+# sha2 used to compute object hashes for copied data
+sha2 = "0.11"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tempfile = "3"
+test-log = { version = "0.2", features = ["trace"] }

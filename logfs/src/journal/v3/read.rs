@@ -330,7 +330,7 @@ impl<'a, R: std::io::Read + std::io::Seek> LogReader<'a, R> {
             }
             (frame.header.clone(), Some(frame))
         } else {
-            (bincode::deserialize(header_data)?, None)
+            (crate::encoding::deserialize(header_data)?, None)
         };
         tracing::trace!(?header, "read entry header");
 

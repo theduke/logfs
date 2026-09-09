@@ -3,10 +3,11 @@ resolver = "2"
 members = [
     "logfs",
     "logfs_cli",
+    "objstore_logfs",
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 
 authors = ["Christoph Herzog <chris@theduke.at>"]
 readme = "README.md"

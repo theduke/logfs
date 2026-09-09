@@ -314,8 +314,7 @@ pub fn repair(
         new_state.clone(),
         crypto.clone(),
         &new_config,
-        None,
-        false,
+        crate::LogOpenOptions::default(),
     )?;
     JournalStore::set_durable(&j, true)?;
     JournalStore::sync(&j)?;

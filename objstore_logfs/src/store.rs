@@ -1,0 +1,510 @@
+use std::{collections::BTreeSet, io::Write as _, sync::Arc};
+
+use bytes::Bytes;
+use futures::StreamExt;
+use logfs::{Journal2, KeyMeta, LogFs, LogFsError};
+use tokio::sync::{mpsc, oneshot};
+use tokio::task;
+use url::Url;
+
+use sha2::Digest;
+
+use objstore::{
+    BackendError, ByteRange, Copy, DataSource, DownloadUrlArgs, KeyPage, ListArgs, ObjStore,
+    ObjStoreError, ObjectMeta, ObjectMetaPage, Operation, Put, Result, UploadUrlArgs, ValueStream,
+};
+
+use crate::LogFsObjStoreConfig;
+
+#[derive(Clone)]
+pub struct LogFsObjStore {
+    state: Arc<State>,
+}
+
+struct State {
+    log: LogFs<Journal2>,
+    safe_uri: Url,
+}
+
+impl std::fmt::Debug for LogFsObjStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogFsObjStore")
+            .field("safe_uri", &self.state.safe_uri)
+            .finish()
+    }
+}
+
+impl LogFsObjStore {
+    pub const KIND: &'static str = "objstore.logfs";
+
+    pub fn new(config: LogFsObjStoreConfig) -> Result<Self> {
+        let log_config = config.to_logfs_config();
+        let open_options = config.to_logfs_open_options()?;
+        let log = LogFs::open_with_options(log_config, open_options).map_err(map_logfs_err)?;
+        let safe_uri = config.safe_uri()?;
+
+        Ok(Self {
+            state: Arc::new(State { log, safe_uri }),
+        })
+    }
+
+    fn key_meta_to_object_meta(key: String, meta: KeyMeta) -> ObjectMeta {
+        let mut obj = ObjectMeta::new(key);
+        obj.size = Some(meta.size);
+        // If the backend doesn't provide explicit timestamps, set them to now so
+        // higher-level tests and consumers that expect timestamps will have a
+        // reasonable value. If the backend does expose timestamps in KeyMeta in
+        // the future, prefer those (the KeyMeta currently does not include them).
+        let now = time::OffsetDateTime::now_utc();
+        obj.created_at = Some(now);
+        obj.updated_at = Some(now);
+        if let Some(chunk_size) = meta.chunk_size {
+            obj.extra
+                .insert("chunk_size".to_string(), serde_json::json!(chunk_size));
+        }
+        obj
+    }
+
+    async fn with_log<F, R>(&self, func: F) -> Result<R>
+    where
+        F: FnOnce(LogFs<Journal2>) -> Result<R, LogFsError> + Send + 'static,
+        R: Send + 'static,
+    {
+        let log = self.state.log.clone();
+        task::spawn_blocking(move || func(log))
+            .await
+            .map_err(|source| ObjStoreError::Backend {
+                backend: Self::KIND,
+                operation: Operation::Unknown,
+                details: Box::new(BackendError {
+                    message: Some("logfs blocking task failed".to_string()),
+                    ..BackendError::default()
+                }),
+                source: Some(source.into()),
+            })?
+            .map_err(map_logfs_err)
+    }
+
+    async fn list_raw(
+        &self,
+        args: ListArgs,
+    ) -> Result<(Vec<ObjectMeta>, Option<String>, Option<Vec<String>>)> {
+        let prefix = args.prefix().map(|p| p.to_string()).unwrap_or_default();
+        let limit = args.limit().unwrap_or(1_000) as usize;
+        let cursor = args.cursor().map(|c| c.to_string());
+        let delimiter = args.delimiter().map(|d| d.to_string());
+
+        self.with_log(move |log| {
+            let mut keys = if prefix.is_empty() {
+                log.paths_range(String::new()..)?
+            } else {
+                log.paths_range(prefix.clone()..)?
+            };
+
+            if let Some(cursor) = &cursor {
+                keys.retain(|key| key > cursor);
+            }
+
+            if !prefix.is_empty() {
+                keys.retain(|key| key.starts_with(&prefix));
+            }
+
+            let mut truncated = false;
+            let mut last_processed = None;
+            let mut items = Vec::new();
+            let mut directories: BTreeSet<String> = BTreeSet::new();
+            let mut processed = 0usize;
+
+            for key in keys.into_iter() {
+                processed += 1;
+                last_processed = Some(key.clone());
+
+                if let Some(delim) = delimiter.as_deref()
+                    && !delim.is_empty()
+                {
+                    let stripped = key
+                        .strip_prefix(&prefix)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| key.clone());
+                    if let Some(idx) = stripped.find(delim) {
+                        let dir = &stripped[..idx];
+                        let mut full = prefix.clone();
+                        full.push_str(dir);
+                        directories.insert(full);
+                        if processed >= limit {
+                            truncated = true;
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                let key_meta = match log.get_meta(&key)? {
+                    Some(meta) => meta,
+                    None => continue,
+                };
+                let meta = Self::key_meta_to_object_meta(key.clone(), key_meta);
+                items.push(meta);
+
+                if processed >= limit {
+                    truncated = true;
+                    break;
+                }
+            }
+
+            let directories = if directories.is_empty() {
+                None
+            } else {
+                Some(directories.into_iter().collect())
+            };
+
+            let next_cursor = if truncated {
+                last_processed
+            } else {
+                items.last().map(|item| item.key.clone())
+            };
+
+            Ok((items, next_cursor, directories))
+        })
+        .await
+    }
+
+    async fn spawn_reader_stream(
+        &self,
+        key: String,
+        range: Option<std::ops::Range<u64>>,
+    ) -> Result<Option<ValueStream>> {
+        let log = self.state.log.clone();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<bool, LogFsError>>();
+        let (tx, rx) = mpsc::channel::<Result<Bytes, LogFsError>>(8);
+
+        task::spawn_blocking(move || {
+            let path = key.clone();
+            match log.get_chunks(&path) {
+                Ok(mut reader) => {
+                    let mut remaining = range.as_ref().map(|range| range.end - range.start);
+                    if remaining == Some(0) {
+                        let _ = ready_tx.send(Ok(true));
+                        return;
+                    }
+                    if let Some(range) = &range
+                        && range.start > 0
+                        && let Err(error) = reader.skip_bytes(range.start)
+                    {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                    let _ = ready_tx.send(Ok(true));
+                    for chunk in reader.by_ref() {
+                        if remaining == Some(0) {
+                            break;
+                        }
+                        let chunk = chunk.map(|mut chunk| {
+                            if let Some(remaining) = remaining {
+                                chunk.truncate(remaining.min(chunk.len() as u64) as usize);
+                            }
+                            chunk
+                        });
+                        if let Ok(chunk) = &chunk
+                            && let Some(remaining) = &mut remaining
+                        {
+                            *remaining -= chunk.len() as u64;
+                        }
+                        let chunk = chunk.map(Bytes::from);
+                        if tx.blocking_send(chunk).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(LogFsError::NotFound { .. }) => {
+                    let _ = ready_tx.send(Ok(false));
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                }
+            }
+        });
+
+        match ready_rx.await.map_err(|source| ObjStoreError::Internal {
+            message: "logfs reader coordination failed".to_string(),
+            source: Some(source.into()),
+        })? {
+            Ok(true) => {
+                let stream = futures::stream::unfold(rx, |mut rx| async {
+                    rx.recv()
+                        .await
+                        .map(|item| (item.map_err(map_logfs_err), rx))
+                });
+                Ok(Some(Box::pin(stream)))
+            }
+            Ok(false) => Ok(None),
+            Err(err) => Err(map_logfs_err(err)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjStore for LogFsObjStore {
+    fn kind(&self) -> &str {
+        Self::KIND
+    }
+
+    fn safe_uri(&self) -> &Url {
+        &self.state.safe_uri
+    }
+
+    async fn healthcheck(&self) -> Result<()> {
+        self.with_log(|log| {
+            log.superblock()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn meta(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        let key = key.to_string();
+        self.with_log(move |log| match log.get_meta(&key)? {
+            Some(meta) => Ok(Some(Self::key_meta_to_object_meta(key, meta))),
+            None => Ok(None),
+        })
+        .await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<Bytes>> {
+        let key = key.to_string();
+        let data = self.with_log(move |log| log.get(&key)).await?;
+        Ok(data.map(Bytes::from))
+    }
+
+    async fn get_stream(&self, key: &str) -> Result<Option<ValueStream>> {
+        self.spawn_reader_stream(key.to_string(), None).await
+    }
+
+    async fn get_range_stream(&self, key: &str, range: ByteRange) -> Result<Option<ValueStream>> {
+        let meta = match self.meta(key).await? {
+            Some(meta) => meta,
+            None => return Ok(None),
+        };
+        let size = meta.size.ok_or_else(|| ObjStoreError::InvalidMetadata {
+            key: key.to_string(),
+            message: "object size is required for ranged reads".to_string(),
+            source: None,
+        })?;
+        let range = range
+            .resolve(size)
+            .map_err(|message| ObjStoreError::InvalidRequest {
+                message: format!("invalid byte range for {key:?}: {message}"),
+                source: None,
+            })?;
+        self.spawn_reader_stream(key.to_string(), Some(range)).await
+    }
+
+    async fn get_with_meta(&self, key: &str) -> Result<Option<(Bytes, ObjectMeta)>> {
+        let key = key.to_string();
+        self.with_log(move |log| {
+            let data = match log.get(&key)? {
+                Some(data) => data,
+                None => return Ok(None),
+            };
+            let meta = match log.get_meta(&key)? {
+                Some(meta) => Self::key_meta_to_object_meta(key.clone(), meta),
+                None => return Ok(None),
+            };
+            Ok(Some((Bytes::from(data), meta)))
+        })
+        .await
+    }
+
+    async fn get_stream_with_meta(&self, key: &str) -> Result<Option<(ObjectMeta, ValueStream)>> {
+        if let Some(meta) = self.meta(key).await?
+            && let Some(stream) = self.get_stream(key).await?
+        {
+            return Ok(Some((meta, stream)));
+        }
+        Ok(None)
+    }
+
+    async fn generate_download_url(&self, _args: DownloadUrlArgs) -> Result<Option<url::Url>> {
+        Ok(None)
+    }
+
+    async fn generate_upload_url(&self, _args: UploadUrlArgs) -> Result<Option<url::Url>> {
+        Ok(None)
+    }
+
+    async fn send_put(&self, put: Put) -> Result<ObjectMeta> {
+        let key = put.key.clone();
+        match put.data {
+            DataSource::Data(bytes) => {
+                let data = bytes.to_vec();
+                self.with_log(move |log| {
+                    log.insert(key.clone(), data)?;
+                    let meta = log
+                        .get_meta(&key)?
+                        .ok_or_else(|| LogFsError::NotFound { path: key.clone() })?;
+                    Ok(Self::key_meta_to_object_meta(key, meta))
+                })
+                .await
+            }
+            DataSource::Stream(sized) => {
+                let mut stream = sized.into_stream();
+                let log = self.state.log.clone();
+                let key_clone = key.clone();
+                let (tx, rx) = mpsc::channel::<Bytes>(8);
+                let writer_handle =
+                    task::spawn_blocking(move || -> Result<ObjectMeta, LogFsError> {
+                        let mut rx = rx;
+                        let mut writer = log.insert_writer(key_clone.clone())?;
+                        while let Some(chunk) = rx.blocking_recv() {
+                            writer.write_all(&chunk)?;
+                        }
+                        writer.finish()?;
+                        let meta =
+                            log.get_meta(&key_clone)?
+                                .ok_or_else(|| LogFsError::NotFound {
+                                    path: key_clone.clone(),
+                                })?;
+                        Ok(Self::key_meta_to_object_meta(key_clone, meta))
+                    });
+
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    tx.send(chunk).await.map_err(|_| ObjStoreError::Internal {
+                        message: "logfs writer task dropped receiver".to_string(),
+                        source: None,
+                    })?;
+                }
+                drop(tx);
+
+                writer_handle
+                    .await
+                    .map_err(|source| ObjStoreError::Backend {
+                        backend: Self::KIND,
+                        operation: Operation::Put,
+                        details: Box::new(BackendError {
+                            message: Some("logfs writer task failed".to_string()),
+                            ..BackendError::default()
+                        }),
+                        source: Some(source.into()),
+                    })?
+                    .map_err(map_logfs_err)
+            }
+        }
+    }
+
+    async fn send_copy(&self, copy: Copy) -> Result<ObjectMeta> {
+        self.with_log(move |log| {
+            let data = log
+                .get(&copy.source_key)?
+                .ok_or_else(|| LogFsError::NotFound {
+                    path: copy.source_key.clone(),
+                })?;
+            // Compute SHA256 of the copied data so higher-level code/tests can rely on it.
+            let digest = sha2::Sha256::digest(&data);
+            log.insert(copy.target_key.clone(), data)?;
+            let meta = log
+                .get_meta(&copy.target_key)?
+                .ok_or_else(|| LogFsError::NotFound {
+                    path: copy.target_key.clone(),
+                })?;
+            let mut obj = Self::key_meta_to_object_meta(copy.target_key.clone(), meta);
+            obj.hash_sha256 = Some(digest.into());
+            Ok(obj)
+        })
+        .await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        let key = key.to_string();
+        self.with_log(move |log| {
+            log.remove(&key)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn delete_prefix(&self, prefix: &str) -> Result<()> {
+        let prefix = prefix.to_string();
+        self.with_log(move |log| {
+            log.remove_prefix(&prefix)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn list(&self, args: ListArgs) -> Result<ObjectMetaPage> {
+        let (items, next_cursor, prefixes) = self.list_raw(args).await?;
+        Ok(ObjectMetaPage {
+            items,
+            next_cursor,
+            prefixes,
+        })
+    }
+
+    async fn list_keys(&self, args: ListArgs) -> Result<KeyPage> {
+        let page = self.list(args).await?;
+        Ok(KeyPage {
+            next_cursor: page.next_cursor,
+            items: page.items.into_iter().map(|meta| meta.key).collect(),
+        })
+    }
+}
+
+fn map_logfs_err(source: LogFsError) -> ObjStoreError {
+    match source {
+        LogFsError::NotFound { path } => ObjStoreError::ObjectNotFound {
+            key: path,
+            source: None,
+        },
+        source => ObjStoreError::Backend {
+            backend: LogFsObjStore::KIND,
+            operation: Operation::Unknown,
+            details: Box::new(BackendError {
+                message: Some(source.to_string()),
+                ..BackendError::default()
+            }),
+            source: Some(source.into()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[test_log::test]
+    async fn test_logfs_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = crate::LogFsCryptoConfig {
+            key: "hello123".to_string(),
+            salt: b"saltysalt".to_vec(),
+            iterations: NonZeroU32::new(1).unwrap(),
+        };
+        let path = dir.path().join("store.log");
+        std::fs::write(&path, [0x5a; 127]).unwrap();
+        let config = LogFsObjStoreConfig::new(path)
+            .with_version(3)
+            .with_offset(127)
+            .with_allow_create(true)
+            .with_crypto(crypto);
+        let store = LogFsObjStore::new(config).unwrap();
+
+        store.healthcheck().await.unwrap();
+        let meta = store
+            .send_put(Put::new("dir/key", Bytes::from_static(b"hello")))
+            .await
+            .unwrap();
+        assert_eq!(meta.size, Some(5));
+        assert_eq!(store.get("dir/key").await.unwrap().unwrap(), b"hello"[..]);
+
+        store.send_copy(Copy::new("dir/key", "copy")).await.unwrap();
+        let keys = store.list_keys(ListArgs::new()).await.unwrap();
+        assert_eq!(keys.items, ["copy", "dir/key"]);
+
+        store.delete("dir/key").await.unwrap();
+        assert!(store.get("dir/key").await.unwrap().is_none());
+    }
+}
