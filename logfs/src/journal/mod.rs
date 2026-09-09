@@ -1,4 +1,7 @@
+mod codec;
+pub(crate) mod data;
 pub mod v2;
+pub mod v3;
 pub use v2::{Journal2, Superblock};
 
 use std::{collections::BTreeMap, num::NonZeroU64, path::PathBuf, sync::Arc};
@@ -9,7 +12,7 @@ use crate::{
     state::{KeyPointer, SharedTree},
 };
 
-use self::v2::{
+use self::v3::{
     read::{KeyChunkIter, StdKeyReader},
     write::KeyWriter,
 };

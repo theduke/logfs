@@ -27,7 +27,7 @@ pub fn repair(
     let file_size = determine_file_size(&mut f)?;
     let probe_offset = log_config.offset.unwrap_or_default();
     let root = read::LogReader::new_start(f.try_clone()?, probe_offset, crypto.as_deref())
-        .read_superblocks()?;
+        .read_repair_superblocks()?;
     let (is_v3, v3_identity, derived_v3_crypto) = match &root.format {
         super::RootFormat::LegacyV2 => (false, None, None),
         super::RootFormat::V3 {
@@ -101,12 +101,7 @@ pub fn repair(
         }
 
         let overlap = if is_v3 {
-            24 + data::JournalEntryHeader::SERIALIZED_LEN as u64
-                + crypto
-                    .as_ref()
-                    .map(|value| value.extra_payload_len())
-                    .unwrap_or(super::V3_PLAIN_METADATA_CHECKSUM_LEN as u64)
-                - 1
+            super::frame_header_len(crypto.is_some()) as u64 - 1
         } else {
             data::JournalEntryHeader::SERIALIZED_LEN as u64
                 + crypto

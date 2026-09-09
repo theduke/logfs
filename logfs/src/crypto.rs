@@ -279,16 +279,16 @@ impl Crypto {
 
 impl V3Crypto {
     pub(crate) fn new(log_secret: &[u8; 32]) -> Self {
-        fn expand(secret: &[u8; 32], context: &[u8]) -> [u8; 32] {
+        fn expand(secret: &[u8; 32], context: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
             let hkdf = Hkdf::<Sha256>::new(Some(b"logfs/v3/log-secret"), secret);
-            let mut key = [0u8; 32];
-            hkdf.expand(context, &mut key)
+            let mut key = zeroize::Zeroizing::new([0u8; 32]);
+            hkdf.expand(context, key.as_mut())
                 .expect("internal error: valid HKDF output length");
             key
         }
-        let entry = zeroize::Zeroizing::new(expand(log_secret, b"entry"));
-        let root = zeroize::Zeroizing::new(expand(log_secret, b"root"));
-        let checkpoint = zeroize::Zeroizing::new(expand(log_secret, b"checkpoint"));
+        let entry = expand(log_secret, b"entry");
+        let root = expand(log_secret, b"root");
+        let checkpoint = expand(log_secret, b"checkpoint");
         Self {
             root_key: XChaCha20Poly1305::new_from_slice(root.as_ref())
                 .expect("internal error: invalid root key length"),
@@ -296,7 +296,7 @@ impl V3Crypto {
                 .expect("internal error: invalid entry key length"),
             checkpoint_key: XChaCha20Poly1305::new_from_slice(checkpoint.as_ref())
                 .expect("internal error: invalid checkpoint key length"),
-            history_key: zeroize::Zeroizing::new(expand(log_secret, b"history")),
+            history_key: expand(log_secret, b"history"),
         }
     }
 
@@ -355,6 +355,19 @@ impl V3Crypto {
         data: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], LogFsError> {
         Self::decrypt_with(&self.entry_key, nonce, aad, data)
+    }
+
+    /// A repair scan expects almost every candidate to fail authentication.
+    /// Avoid allocating an error/backtrace for each byte position examined.
+    pub(crate) fn authenticate_entry_candidate(
+        &self,
+        nonce: [u8; 24],
+        aad: &[u8],
+        data: &mut Vec<u8>,
+    ) -> bool {
+        self.entry_key
+            .decrypt_in_place(&XNonce::from(nonce), aad, data)
+            .is_ok()
     }
 
     pub(crate) fn encrypt_checkpoint(

@@ -420,7 +420,7 @@ impl<J: JournalStore> LogFs<J> {
     pub fn insert_writer(
         &self,
         path: impl Into<String>,
-    ) -> Result<journal::v2::write::KeyWriter, LogFsError> {
+    ) -> Result<journal::v3::write::KeyWriter, LogFsError> {
         if self.inner.config.readonly {
             return Err(LogFsError::ReadOnly);
         }
@@ -1173,7 +1173,7 @@ mod tests {
 
         let crypto = crate::crypto::Crypto::new(crypto_config);
         let payload_offset =
-            crate::journal::v2::checkpoint_payload_offset(&config.path, Some(&crypto), 0).unwrap();
+            crate::journal::v3::checkpoint_payload_offset(&config.path, Some(&crypto), 0).unwrap();
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1378,7 +1378,7 @@ mod tests {
             .write(true)
             .open(&config.path)
             .unwrap()
-            .set_len(crate::journal::v2::V3_HEADER_SIZE)
+            .set_len(crate::journal::v3::V3_HEADER_SIZE)
             .unwrap();
         assert!(LogFs::<Journal2>::open(config).is_err());
     }
@@ -1397,14 +1397,14 @@ mod tests {
                 .open(&config.path)
                 .unwrap();
             file.seek(std::io::SeekFrom::Start(
-                crate::journal::v2::V3_HEADER_SIZE + relative,
+                crate::journal::v3::V3_HEADER_SIZE + relative,
             ))
             .unwrap();
             let mut byte = [0u8; 1];
             file.read_exact(&mut byte).unwrap();
             byte[0] ^= 1;
             file.seek(std::io::SeekFrom::Start(
-                crate::journal::v2::V3_HEADER_SIZE + relative,
+                crate::journal::v3::V3_HEADER_SIZE + relative,
             ))
             .unwrap();
             file.write_all(&byte).unwrap();
@@ -1415,7 +1415,7 @@ mod tests {
 
     #[test]
     fn injected_persistence_failures_taint_without_stranding_writer() {
-        use crate::journal::v2::write::{
+        use crate::journal::v3::write::{
             FAIL_DATA_FLUSH, FAIL_DATA_SYNC, FAIL_DATA_WRITE, FAIL_METADATA_WRITE, FAIL_ROOT_SYNC,
             FAIL_ROOT_WRITE, inject_next_io_failure,
         };
@@ -2190,8 +2190,8 @@ mod tests {
         assert_ne!(&initial_roots[16..40], &bytes[16..40]);
         assert_ne!(&initial_roots[4112..4136], &bytes[4112..4136]);
         assert_ne!(
-            &bytes[crate::journal::v2::V3_HEADER_SIZE as usize
-                ..crate::journal::v2::V3_HEADER_SIZE as usize + 24],
+            &bytes[crate::journal::v3::V3_HEADER_SIZE as usize
+                ..crate::journal::v3::V3_HEADER_SIZE as usize + 24],
             &bytes[second_offset as usize..second_offset as usize + 24]
         );
     }
@@ -2287,7 +2287,7 @@ mod tests {
         let bytes = std::fs::read(&config.path).unwrap();
         assert_eq!(bytes.len(), region_len as usize);
         assert!(
-            !bytes[crate::journal::v2::V3_HEADER_SIZE as usize..]
+            !bytes[crate::journal::v3::V3_HEADER_SIZE as usize..]
                 .windows(64)
                 .any(|window| window == [0u8; 64])
         );
@@ -2307,7 +2307,7 @@ mod tests {
     #[test]
     fn obsolete_development_v3_is_not_opened_or_reformatted() {
         let config = test_config("obsolete-v3-no-fallback");
-        let mut bytes = vec![0x5a; crate::journal::v2::V3_HEADER_SIZE as usize];
+        let mut bytes = vec![0x5a; crate::journal::v3::V3_HEADER_SIZE as usize];
         bytes[..8].copy_from_slice(b"LOGFS3R\0");
         std::fs::write(&config.path, &bytes).unwrap();
         assert!(LogFs::<Journal2>::open(config.clone()).is_err());

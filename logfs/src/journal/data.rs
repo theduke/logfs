@@ -1,6 +1,6 @@
 //! Types representing the data written to the log.
 
-use crate::{DataOffset, crypto::Crypto, journal::SequenceId};
+use crate::{crypto::Crypto, journal::SequenceId};
 
 // /// A magic marker used to
 // #[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone, Debug)]
@@ -108,47 +108,6 @@ pub struct ActionKeyRename {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 pub struct ActionKeyDelete {
     pub deleted_keys: Vec<KeyPath>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct KeyIndexEntry {
-    pub key: KeyPath,
-    pub sequence_id: SequenceId,
-    pub file_offset: DataOffset,
-    pub size: ByteCountU64,
-    pub chunk_size: Option<ByteCountU32>,
-}
-
-/// An index that contains all keys and associated metadata.
-///
-/// An index can be written to the log to speed up re-opening.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct KeyIndex {
-    /// Pointer to a previous index location.
-    /// If present, this index is only partial and does not contain a full
-    /// snapshot. To build a full index, the parent must be read first.
-    /// This index will contain all updates since the previous one.
-    pub parent_entry: Option<EntryPointer>,
-
-    /// The available keys. If [`Self::parent_entry`] is [`None`], this is a
-    /// full snapshot, otherwise it's a partial snapshot since the last entry.
-    pub keys: Vec<KeyIndexEntry>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct KeyIndexEntryV3 {
-    pub key: KeyPath,
-    pub sequence_id: SequenceId,
-    pub entry_nonce: Option<[u8; 24]>,
-    pub file_offset: DataOffset,
-    pub size: ByteCountU64,
-    pub chunk_size: Option<ByteCountU32>,
-    pub hash: Option<Sha256Hash>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
-pub struct KeyIndexV3 {
-    pub keys: Vec<KeyIndexEntryV3>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]

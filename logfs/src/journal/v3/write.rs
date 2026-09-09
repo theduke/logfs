@@ -1,5 +1,5 @@
 use std::{
-    io::{BufWriter, Cursor, Seek, SeekFrom, Write},
+    io::{BufWriter, Seek, SeekFrom, Write},
     sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
@@ -11,7 +11,7 @@ use crate::{
     crypto::{Crypto, V3Crypto, V3RootCrypto},
     journal::{
         SequenceId,
-        v2::{ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, data::EntryPointer},
+        v3::{ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, data::EntryPointer},
     },
     state::KeyPointer,
 };
@@ -350,9 +350,7 @@ impl LogWriter {
 
     fn metadata_padding(&self) -> u64 {
         if self.v3_identity().is_some() {
-            self.crypto()
-                .map(|crypto| crypto.extra_payload_len())
-                .unwrap_or(super::V3_PLAIN_METADATA_CHECKSUM_LEN as u64)
+            super::metadata_padding(self.crypto.is_some()) as u64
         } else {
             self.data_padding()
         }
@@ -402,7 +400,7 @@ impl LogWriter {
         };
 
         let format = match self.active_superblock.format {
-            super::RootFormat::LegacyV2 => super::RootFormat::LegacyV2,
+            super::RootFormat::LegacyV2 => return Err(LogFsError::ReadOnly),
             super::RootFormat::V3 {
                 identity,
                 generation,
@@ -459,111 +457,12 @@ impl LogWriter {
             debug_assert!(ptr.sequence < self.next_sequence);
         }
 
-        let buffer = match &block.format {
-            super::RootFormat::LegacyV2 => {
-                let block_size = data::Superblock::SERIALIZED_LEN - self.data_padding();
-                let mut buffer = bincode::serialize(&block.block)?;
-                if buffer.len() as u64 >= block_size {
-                    return Err(LogFsError::new_internal("Legacy superblock is too large"));
-                }
-                buffer.resize(block_size as usize, 0);
-                if let Some(crypto) = self.crypto() {
-                    crypto.encrypt_data(0, block.index as u32, &mut buffer)?;
-                }
-                buffer
-            }
-            super::RootFormat::V3 {
-                identity,
-                generation,
-                log_secret,
-                root_salts,
-                history,
-                checkpoint_history,
-            } => {
-                let payload = bincode::serialize(&super::V3RootPayload {
-                    magic: super::V3_INNER_MAGIC,
-                    version: 3,
-                    profile: self.crypto().map(Crypto::profile).unwrap_or_default(),
-                    identity: *identity,
-                    slot: u8::try_from(block.index)
-                        .map_err(|_| LogFsError::new_internal("V3 root slot overflow"))?,
-                    generation: *generation,
-                    block: block.block.clone(),
-                    log_secret: **log_secret,
-                    root_salts: *root_salts,
-                    history: *history,
-                    checkpoint_history: *checkpoint_history,
-                })?;
-                let encrypted = self.crypto.is_some();
-                let clear_len = if encrypted {
-                    super::V3_ROOT_CLEAR_LEN
-                } else {
-                    super::V3_ROOT_RECORD_LEN
-                        - super::V3_ROOT_OUTER_LEN
-                        - super::V3_PLAIN_METADATA_CHECKSUM_LEN
-                };
-                let required_clear = if encrypted {
-                    60usize
-                        .checked_add(payload.len())
-                        .and_then(|length| length.checked_add(Crypto::EXTRA_PAYLOAD_LEN))
-                } else {
-                    4usize.checked_add(payload.len())
-                };
-                if required_clear.is_none_or(|required| required > clear_len) {
-                    return Err(LogFsError::new_internal("V3 root payload is too large"));
-                }
-                let random = ring::rand::SystemRandom::new();
-                let mut buffer = vec![0u8; super::V3_ROOT_RECORD_LEN];
-                buffer[..super::V3_ROOT_SALT_LEN].copy_from_slice(&root_salts[block.index]);
-                let mut nonce = [0u8; super::V3_NONCE_LEN];
-                random
-                    .fill(&mut nonce)
-                    .map_err(|_| LogFsError::new_internal("Could not generate v3 root nonce"))?;
-                buffer[super::V3_ROOT_SALT_LEN..super::V3_ROOT_OUTER_LEN].copy_from_slice(&nonce);
-                let mut clear = vec![0u8; clear_len];
-                if !encrypted {
-                    random.fill(&mut clear).map_err(|_| {
-                        LogFsError::new_internal("Could not randomize v3 root padding")
-                    })?;
-                }
-                if encrypted {
-                    let mut inner_nonce = [0u8; 24];
-                    random.fill(&mut inner_nonce).map_err(|_| {
-                        LogFsError::new_internal("Could not generate separated v3 root nonce")
-                    })?;
-                    let mut inner = payload;
-                    self.v3_crypto
-                        .as_ref()
-                        .ok_or_else(|| LogFsError::new_internal("Missing v3 log-secret key"))?
-                        .encrypt_root(inner_nonce, &[block.index as u8], &mut inner)?;
-                    clear[..32].copy_from_slice(log_secret.as_ref());
-                    clear[32..56].copy_from_slice(&inner_nonce);
-                    clear[56..60].copy_from_slice(
-                        &u32::try_from(inner.len())
-                            .map_err(|_| LogFsError::new_internal("V3 inner root overflow"))?
-                            .to_le_bytes(),
-                    );
-                    clear[60..60 + inner.len()].copy_from_slice(&inner);
-                    self.v3_root_crypto
-                        .as_ref()
-                        .ok_or_else(|| LogFsError::new_internal("Missing v3 root key"))?
-                        .encrypt(block.index, nonce, &mut clear)?;
-                    buffer[super::V3_ROOT_OUTER_LEN..].copy_from_slice(&clear);
-                } else {
-                    clear[..4].copy_from_slice(
-                        &u32::try_from(payload.len())
-                            .map_err(|_| LogFsError::new_internal("V3 root payload overflow"))?
-                            .to_le_bytes(),
-                    );
-                    clear[4..4 + payload.len()].copy_from_slice(&payload);
-                    let clear_end = super::V3_ROOT_OUTER_LEN + clear.len();
-                    buffer[super::V3_ROOT_OUTER_LEN..clear_end].copy_from_slice(&clear);
-                    let hash: [u8; 32] = sha2::Sha256::digest(&buffer[..clear_end]).into();
-                    buffer[clear_end..].copy_from_slice(&hash);
-                }
-                buffer
-            }
-        };
+        let buffer = super::root::encode_root(
+            &block,
+            self.crypto(),
+            self.v3_crypto.as_ref(),
+            self.v3_root_crypto.as_ref(),
+        )?;
 
         let offset = self
             .base_offset
@@ -584,8 +483,7 @@ impl LogWriter {
 
     fn prepare_entry_nonce(&mut self) -> Result<Option<[u8; 24]>, LogFsError> {
         if !matches!(self.active_superblock.format, super::RootFormat::V3 { .. }) {
-            self.current_entry_nonce = None;
-            return Ok(None);
+            return Err(LogFsError::ReadOnly);
         }
         let mut nonce = [0u8; 24];
         ring::rand::SystemRandom::new()
@@ -623,23 +521,14 @@ impl LogWriter {
             ));
         }
         let action_plain_len = bincode::serialized_size(&action)?;
-        let metadata_padding = self.metadata_padding();
-        let domain_len = if matches!(self.active_superblock.format, super::RootFormat::V3 { .. }) {
-            8
-        } else {
-            0
-        };
-        let total_len = [
-            domain_len,
-            data::JournalEntryHeader::SERIALIZED_LEN as u64,
-            metadata_padding,
+        if self.is_legacy_v2() {
+            return Err(LogFsError::ReadOnly);
+        }
+        let total_len = super::frame_len(
             action_plain_len,
-            metadata_padding,
             action.payload_len(self.crypto()),
-        ]
-        .into_iter()
-        .try_fold(0u64, |total, length| total.checked_add(length))
-        .ok_or_else(|| LogFsError::new_internal("Journal entry size overflow"))?;
+            self.crypto.is_some(),
+        )?;
         self.ensure_capacity(total_len)?;
         if self.tainted.is_tainted() {
             return Err(LogFsError::Tainted);
@@ -721,6 +610,7 @@ impl LogWriter {
         let sequence = self.next_sequence;
         let entry_offset = self.offset - self.base_offset;
 
+        super::frame_len(bincode::serialized_size(action)?, 0, self.crypto.is_some())?;
         let action_plain = bincode::serialize(&action)?;
         let mut action_data = action_plain.clone();
         if let Some(identity) = self.v3_identity() {
@@ -737,8 +627,8 @@ impl LogWriter {
             } else {
                 super::append_plain_metadata_checksum(&mut action_data, &aad);
             }
-        } else if let Some(crypto) = self.crypto.as_ref() {
-            crypto.encrypt_data(sequence.as_u64(), ENTRY_ACTION_CHUNK, &mut action_data)?;
+        } else {
+            return Err(LogFsError::ReadOnly);
         }
         let action_data_len = action_data.len();
 
@@ -754,7 +644,7 @@ impl LogWriter {
                 .map_err(|_| LogFsError::new_internal("Journal action exceeds format limit"))?,
             flags,
         };
-        let mut next_history = None;
+        let next_history;
         let mut header_data = if let Some(identity) = self.v3_identity() {
             let entry_nonce = self
                 .current_entry_nonce
@@ -791,7 +681,7 @@ impl LogWriter {
             clear[4..4 + encoded.len()].copy_from_slice(&encoded);
             clear
         } else {
-            bincode::serialize(&header)?
+            return Err(LogFsError::ReadOnly);
         };
         if let Some(identity) = self.v3_identity() {
             let entry_nonce = self
@@ -807,8 +697,8 @@ impl LogWriter {
             } else {
                 super::append_plain_metadata_checksum(&mut header_data, &aad);
             }
-        } else if let Some(crypto) = self.crypto.as_ref() {
-            crypto.encrypt_data(sequence.as_u64(), ENTRY_HEADER_CHUNK, &mut header_data)?;
+        } else {
+            return Err(LogFsError::ReadOnly);
         }
 
         let domain_len = if self.current_entry_nonce.is_some() {
@@ -852,16 +742,10 @@ impl LogWriter {
         &mut self,
         action: &data::JournalAction,
     ) -> Result<data::JournalEntryHeader, LogFsError> {
+        let reserved = self.preflight_stream_action(action)?;
         self.prepare_entry_nonce()?;
-        if self.current_entry_nonce.is_none() {
-            return self.write_action(action, true);
-        }
 
-        let action_plain = bincode::serialize(action)?;
-        let action_size = action_plain
-            .len()
-            .checked_add(self.metadata_padding() as usize)
-            .ok_or_else(|| LogFsError::new_internal("Streaming action size overflow"))?;
+        let action_size = bincode::serialized_size(action)? + self.metadata_padding();
         let header = data::JournalEntryHeader {
             offset: self.offset - self.base_offset,
             sequence_id: self.next_sequence,
@@ -869,20 +753,26 @@ impl LogWriter {
                 .map_err(|_| LogFsError::new_internal("Streaming action is too large"))?,
             flags: data::JournalEntryHeaderFlags::empty(),
         };
-        let header_size = super::V3_FRAME_HEADER_CLEAR_LEN + self.metadata_padding() as usize;
-        let reserved = 24usize
-            .checked_add(header_size)
-            .and_then(|size| size.checked_add(action_size))
-            .ok_or_else(|| LogFsError::new_internal("Streaming reservation overflow"))?;
-        let mut random_bytes = vec![0u8; reserved];
+        let mut random_bytes = vec![0u8; reserved as usize];
         ring::rand::SystemRandom::new()
             .fill(&mut random_bytes)
             .map_err(|_| LogFsError::new_internal("Could not randomize streaming reservation"))?;
-        self.ensure_capacity(reserved as u64)?;
+        self.ensure_capacity(reserved)?;
         self.writer.write_all(&random_bytes)?;
-        self.offset += reserved as u64;
+        self.offset += reserved;
         self.incomplete_entry_in_progress = true;
         Ok(header)
+    }
+
+    fn preflight_stream_action(&self, action: &data::JournalAction) -> Result<u64, LogFsError> {
+        if self.is_legacy_v2() {
+            return Err(LogFsError::ReadOnly);
+        }
+        let reserved =
+            super::frame_len(bincode::serialized_size(action)?, 0, self.crypto.is_some())?;
+        // Even an empty encrypted value needs one authentication tag.
+        self.ensure_capacity(reserved + self.data_padding())?;
+        Ok(reserved)
     }
 
     fn write_data(&mut self, chunk_size: u32, data: Vec<u8>) -> Result<u64, LogFsError> {
@@ -929,62 +819,14 @@ impl LogWriter {
         tree: &std::collections::BTreeMap<String, KeyPointer>,
     ) -> Result<(), LogFsError> {
         let started = std::time::Instant::now();
-        let v3 = matches!(self.active_superblock.format, super::RootFormat::V3 { .. });
-        let serialized = if v3 {
-            bincode::serialize(&data::KeyIndexV3 {
-                keys: tree
-                    .iter()
-                    .map(|(key, ptr)| data::KeyIndexEntryV3 {
-                        key: key.clone(),
-                        sequence_id: SequenceId::from_u64(ptr.sequence_id),
-                        entry_nonce: ptr.entry_nonce,
-                        file_offset: ptr.file_offset,
-                        size: ptr.size,
-                        chunk_size: ptr.chunk_size,
-                        hash: ptr.hash.map(data::Sha256Hash),
-                    })
-                    .collect(),
-            })?
-        } else {
-            bincode::serialize(&data::KeyIndex {
-                parent_entry: None,
-                keys: tree
-                    .iter()
-                    .map(|(key, ptr)| data::KeyIndexEntry {
-                        key: key.clone(),
-                        sequence_id: SequenceId::from_u64(ptr.sequence_id),
-                        file_offset: ptr.file_offset,
-                        size: ptr.size,
-                        chunk_size: ptr.chunk_size,
-                    })
-                    .collect(),
-            })?
-        };
-        if serialized.len() > super::MAX_CHECKPOINT_DECODED_BYTES {
-            return Err(LogFsError::new_internal(
-                "Checkpoint exceeds the 512 MiB resource limit",
-            ));
+        if self.is_legacy_v2() {
+            return Err(LogFsError::ReadOnly);
         }
+        let serialized = super::index::serialize_snapshot(tree, self.crypto.is_some())?;
         let serialized_size = serialized.len();
         let serialization_elapsed = started.elapsed();
         let compression_started = std::time::Instant::now();
-        let (payload, compression) = if v3 {
-            // V3 snapshots are bounded directly by their committed payload
-            // length and avoid an attacker-controlled decompression expansion.
-            (serialized, None)
-        } else {
-            let mut input = serialized.as_slice();
-            let mut output = Cursor::new(Vec::new());
-            brotli::BrotliCompress(
-                &mut input,
-                &mut output,
-                &brotli::enc::BrotliEncoderParams {
-                    quality: 4,
-                    ..brotli::enc::BrotliEncoderInitParams()
-                },
-            )?;
-            (output.into_inner(), Some(data::CompressionFormat::Brotli))
-        };
+        let (payload, compression) = (serialized, None);
         let compression_elapsed = compression_started.elapsed();
         let payload_size = payload.len();
         let hash = data::Sha256Hash(sha2::Sha256::digest(&payload).into());
@@ -993,13 +835,10 @@ impl LogWriter {
             hash,
             compression,
         };
-        let action = if v3 {
-            data::JournalAction::IndexWriteV3(index_action)
-        } else {
-            data::JournalAction::IndexWrite(index_action)
-        };
-        let chunk_size = u32::try_from(payload.len().max(1))
-            .map_err(|_| LogFsError::new_internal("Checkpoint payload exceeds v2 limit"))?;
+        let action = data::JournalAction::IndexWriteV3(index_action);
+        let chunk_size = u32::try_from(payload.len().max(1)).map_err(|_| {
+            LogFsError::new_internal("Checkpoint payload exceeds chunk-size format limit")
+        })?;
         self.write_journal_entry(chunk_size, action, Some(payload), false)?;
         tracing::debug!(
             key_count = tree.len(),
@@ -1008,7 +847,6 @@ impl LogWriter {
             serialization_ms = serialization_elapsed.as_millis(),
             compression_ms = compression_elapsed.as_millis(),
             total_ms = started.elapsed().as_millis(),
-            v3,
             "full checkpoint written"
         );
         Ok(())
@@ -1049,8 +887,8 @@ impl LogWriter {
             } else {
                 crypto.encrypt_entry(super::v3_nonce(entry_nonce, chunk), &aad, data)?;
             }
-        } else if let Some(crypto) = self.crypto.as_ref() {
-            crypto.encrypt_data(self.next_sequence.as_u64(), chunk, data)?;
+        } else if self.is_legacy_v2() {
+            return Err(LogFsError::ReadOnly);
         }
         let len = data.len() as u64;
 
@@ -1097,6 +935,11 @@ impl LogChunkWriter {
             },
         });
 
+        // Predictable rejection must not taint the writer; no bytes or nonce state
+        // have been touched at this point. I/O errors below still taint it.
+        if let Err(error) = writer.preflight_stream_action(&action) {
+            return Err(Box::new((error, writer)));
+        }
         let header = match writer.reserve_stream_action(&action) {
             Ok(header) => header,
             Err(error) => {
