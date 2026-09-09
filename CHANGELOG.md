@@ -1,20 +1,25 @@
 # Unreleased
 
-* Correct the encrypted v3 key schedule with an authenticated suite flag and
-  HKDF-derived per-file root/entry keys, while retaining unflagged-v3 read/write
-  compatibility.
-* Bind corrected v3 roots to their slots and validate adjacent generation pairs;
-  fix v2/v3 discrimination when legacy value bytes resemble a v3 marker.
+* Replace the unreleased development v3 formats with opaque fixed-size roots
+  and journal framing. Encrypted v3 exposes only random Argon2id salts,
+  XChaCha20-Poly1305 nonces, ciphertext, and unavoidable size/growth leakage;
+  old development v3 is intentionally not accepted.
+* Add fixed named Argon2id profiles and HKDF-separated entry, checkpoint, and
+  history keys rooted in a random per-log secret. Authenticate slot/generation
+  pairs, checkpoint boundaries, and a keyed history chain to reject root,
+  entry, and sibling-history substitution.
+* Keep legacy v2 available through a read-only inspection/export path and make
+  compaction the explicit migration into a freshly created v3 destination.
+* Add exclusive non-durable creation and optional randomized bounded-region
+  initialization while preserving bytes outside the configured region.
 * Fix encrypted legacy-v2 empty writes, bound checkpoint payloads before
   allocation, and stream scrub/compaction verification.
 * Allow checkpoint-restored v2 data to be compacted with its available integrity
   coverage, make repair/compact destination creation exclusive, use locked
   descriptor metadata for format decisions, and initialize CLI tracing once.
-* Add the v3 authenticated/checksummed root envelope, per-entry encrypted nonce
-  domains, and v3 checkpoints that retain value-integrity metadata while keeping
-  legacy v2 decoding intact.
-* Place v3 roots in separate absolute 4 KiB-aligned slots, bind encrypted entry
-  framing to the random file identity, and checksum plaintext v3 metadata.
+* Random-fill transparent root/header padding and incomplete streaming
+  reservations; keep plaintext-v3 metadata checksummed and retain value hashes
+  in v3 checkpoints.
 * Fix checkpoint fallback, committed-tail validation, streaming at nonzero
   offsets, empty values, readonly/create enforcement, batch ordering, writer
   lifecycle errors, and obsolete-value accounting.

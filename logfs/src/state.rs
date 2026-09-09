@@ -18,14 +18,11 @@ pub struct KeyPointer {
     /// Whole-value hash when it was recovered from an entry rather than a
     /// legacy v2 checkpoint (which did not store hashes).
     pub(crate) hash: Option<[u8; 32]>,
-    /// V3 per-entry nonce domain. Legacy v2 entries derive nonces from the
-    /// sequence number and therefore leave this unset.
-    pub(crate) crypto_domain: Option<u64>,
+    /// Opaque v3 entry nonce. Legacy v2 entries leave this unset.
+    pub(crate) entry_nonce: Option<[u8; 24]>,
     /// V3 file identity used as AEAD associated data. Legacy entries leave it
     /// unset.
     pub(crate) log_identity: Option<[u8; 16]>,
-    /// Whether this v3 entry uses the corrected per-file/per-purpose key schedule.
-    pub(crate) derived_crypto: bool,
 }
 
 /// Runtime state of the db.

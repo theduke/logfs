@@ -9,9 +9,8 @@ use crate::{
 };
 
 use super::{
-    RepairConfig, V3_ROOT_COUNT, V3_ROOT_MAGIC, V3_ROOT_MAGIC_COPY_OFFSET, V3_ROOT_SLOT_SIZE, data,
-    determine_file_size, find_entry_header_in_slice, find_v3_entry_header_in_slice, read,
-    read_entry, read_v3_entry, v3_alignment_padding,
+    RepairConfig, data, determine_file_size, find_entry_header_in_slice,
+    find_v3_entry_header_in_slice, read, read_entry, read_v3_entry,
 };
 
 pub fn repair(
@@ -27,65 +26,24 @@ pub fn repair(
     })?;
     let file_size = determine_file_size(&mut f)?;
     let probe_offset = log_config.offset.unwrap_or_default();
-    let valid_legacy = read::LogReader::new_start(f.try_clone()?, probe_offset, crypto.as_deref())
-        .read_superblocks()
-        .is_ok_and(|root| matches!(root.format, super::RootFormat::LegacyV2));
-    let mut v3_identity = None;
-    let mut derived_crypto = false;
-    let mut is_v3 = false;
-    for index in 0..if valid_legacy { 0 } else { V3_ROOT_COUNT } {
-        let offset = probe_offset
-            .checked_add(v3_alignment_padding(probe_offset))
-            .and_then(|offset| offset.checked_add(index.saturating_mul(V3_ROOT_SLOT_SIZE)))
-            .ok_or_else(|| LogFsError::new_internal("Root probe offset overflow"))?;
-        if offset.saturating_add(V3_ROOT_SLOT_SIZE) > file_size {
-            continue;
-        }
-        f.seek(SeekFrom::Start(offset))?;
-        let mut root = vec![0u8; V3_ROOT_SLOT_SIZE as usize];
-        f.read_exact(&mut root)?;
-        if root[..8] == V3_ROOT_MAGIC || root[V3_ROOT_MAGIC_COPY_OFFSET..] == V3_ROOT_MAGIC {
-            is_v3 = true;
-            let root_derived = root[16]
-                & (super::V3_ROOT_FLAG_ENCRYPTED | super::V3_ROOT_FLAG_DERIVED_KEYS)
-                == (super::V3_ROOT_FLAG_ENCRYPTED | super::V3_ROOT_FLAG_DERIVED_KEYS);
-            if v3_identity.is_some() && root_derived != derived_crypto {
-                return Err(LogFsError::new_internal(
-                    "Repair found conflicting v3 crypto suites",
-                ));
-            }
-            derived_crypto = root_derived;
-            let identity: [u8; 16] = root[28..44]
-                .try_into()
-                .map_err(|_| LogFsError::new_internal("Truncated v3 identity"))?;
-            if identity == [0; 16] || v3_identity.is_some_and(|known| known != identity) {
-                return Err(LogFsError::new_internal(
-                    "Repair found conflicting or invalid v3 identities",
-                ));
-            }
-            v3_identity = Some(identity);
-        }
-    }
-    if is_v3 && v3_identity.is_none() {
-        return Err(LogFsError::new_internal(
-            "V3 repair could not recover the authenticated file identity",
-        ));
-    }
-    let required_v3_identity = || {
-        v3_identity.ok_or_else(|| {
-            LogFsError::new_internal("V3 repair could not recover the file identity")
-        })
-    };
-    let derived_v3_crypto = if is_v3 && derived_crypto {
-        Some(
+    let root = read::LogReader::new_start(f.try_clone()?, probe_offset, crypto.as_deref())
+        .read_superblocks()?;
+    let (is_v3, v3_identity, derived_v3_crypto) = match &root.format {
+        super::RootFormat::LegacyV2 => (false, None, None),
+        super::RootFormat::V3 {
+            identity,
+            log_secret,
+            ..
+        } => (
+            true,
+            Some(*identity),
             crypto
                 .as_ref()
-                .ok_or_else(|| LogFsError::new_internal("Encrypted v3 repair requires a key"))?
-                .v3_crypto(required_v3_identity()?),
-        )
-    } else {
-        None
+                .map(|_| crate::crypto::V3Crypto::new(log_secret)),
+        ),
     };
+    let required_v3_identity =
+        || v3_identity.ok_or_else(|| LogFsError::new_internal("V3 repair is missing its identity"));
 
     let mut file_offset = config.skip_bytes.unwrap_or_default();
     if file_offset > file_size {
@@ -143,7 +101,7 @@ pub fn repair(
         }
 
         let overlap = if is_v3 {
-            8 + data::JournalEntryHeader::SERIALIZED_LEN as u64
+            24 + data::JournalEntryHeader::SERIALIZED_LEN as u64
                 + crypto
                     .as_ref()
                     .map(|value| value.extra_payload_len())
@@ -189,7 +147,7 @@ pub fn repair(
         } else {
             read_entry(&mut reader, &mut buffer, crypto_ref, sequence).map(|entry| (entry, None))
         };
-        let (entry, crypto_domain) = match recovered {
+        let (entry, entry_nonce) = match recovered {
             Ok(entry) => entry,
             Err(error) => {
                 tracing::warn!(?error, "could not read entry. stopping read recovery");
@@ -206,7 +164,6 @@ pub fn repair(
                 .header
                 .flags
                 .contains(data::JournalEntryHeaderFlags::INCOMPLETE)
-            || (is_v3 && crypto_domain == Some(0))
         {
             tracing::warn!(
                 ?entry,
@@ -281,9 +238,8 @@ pub fn repair(
                         size: meta.size,
                         chunk_size: meta.chunk_size,
                         hash: Some(meta.hash.0),
-                        crypto_domain,
+                        entry_nonce,
                         log_identity: v3_identity,
-                        derived_crypto: derived_v3_crypto.is_some(),
                     },
                 );
             }
@@ -363,6 +319,8 @@ pub fn repair(
         new_state.clone(),
         crypto.clone(),
         &new_config,
+        None,
+        false,
     )?;
     JournalStore::set_durable(&j, true)?;
     JournalStore::sync(&j)?;
@@ -373,6 +331,7 @@ pub fn repair(
         tracing::trace!(?key, "restoring key");
         let mut source = read::StdKeyReader::new(read::KeyDataReader::new_verified(
             crypto.clone(),
+            derived_v3_crypto.clone().map(Arc::new),
             &pointer,
             file.try_clone()?,
         )?);

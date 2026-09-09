@@ -9,36 +9,34 @@ Supports optional encryption and compression.
 
 ## Storage and durability
 
-New logs use two independently placed roots whose starts are aligned to absolute
-4 KiB boundaries. Each redundant v3 envelope carries duplicate format markers,
-a 128-bit random log identity, and a generation, and is authenticated when
-encryption is enabled (or checksummed otherwise). A corrupt or truncated v3 root
-is an error rather than permission to silently select older acknowledged state.
-New root envelopes authenticate their physical slot and require adjacent,
-slot-parity-consistent generations, preventing a valid older slot from being
-copied over its peer. This detects local duplicate/slot replay; without trusted
-external state, restoring both slots from an older snapshot remains outside the
-format's rollback guarantees.
-The roots use random 96-bit nonces; an encrypted identity is limited to 2^32 root
-publications, giving a birthday-collision bound of approximately 2^-33. Creating
-2^32 independent logs gives the 128-bit identities a collision bound of
-approximately 2^-65.
+New logs use two opaque 4 KiB root slots at the configured region offset. An
+encrypted slot exposes only an independent random 128-bit Argon2id salt, a
+random 192-bit XChaCha20-Poly1305 nonce, and ciphertext. Version, KDF profile,
+128-bit log identity, physical slot, generation, committed tail, checkpoint,
+random per-log secret, and history commitments are inside the authenticated
+payload. The slots require adjacent, parity-consistent generations and matching
+identity, secret, and salts. A corrupt, substituted, or truncated slot is an
+error rather than permission to silently select older acknowledged state. This
+detects local root substitution; restoring both slots and their journal from an
+older snapshot remains outside the format's rollback guarantees without trusted
+external state.
 
-New encrypted logs use HKDF-SHA256 to derive separate root and entry keys for
-each random file identity. Entries also bind their identity and chunk framing as
-AEAD associated data. This makes equal nonces in independently created logs use
-different keys and separates root and entry nonce spaces. Entry nonce domains
-are reserved in a root and synchronized before their ciphertext is written.
-Writable opens choose a fresh random 64-bit domain base,
-so diverging byte-for-byte copies do not deterministically reuse entry nonces.
-The remaining probabilistic limitation is explicit: for `S` independently
-opened copies and at most `L` sequential domains consumed by each, the overlap
-bound is approximately `S²L / 2^65`; export to fresh logs well before that is a
-meaningful risk for the deployment. Existing
-v2 logs and the initial unflagged v3 encryption suite remain readable and
-writable through isolated compatibility paths. Legacy encrypted writes retain
-their historical nonce limitations; export to a fresh file to obtain the
-corrected flagged v3 suite.
+Encrypted v3 roots use the out-of-band named `CryptoProfile` (`Standard`: 64 MiB,
+three passes, one lane; `LowMemory`: 8 MiB, three passes, one lane). The profile
+is redundantly authenticated inside the root. `CryptoConfig::salt` and
+`iterations` remain inputs only to the isolated legacy-v2 PBKDF2 reader.
+The authenticated per-log secret is expanded with HKDF-SHA256 into separate
+entry, checkpoint, and history keys. Journal frames use random nonce seeds,
+fixed-size encrypted headers, purpose-separated nonces, and a keyed history
+chain whose committed tip and checkpoint boundary are authenticated by the
+root. Consequently an entry or checkpoint from a sibling history cannot be
+transplanted even when both histories originated from the same byte-for-byte
+snapshot.
+
+The obsolete development v3 formats are intentionally unsupported and are
+never selected as a fallback after authentication failure. Legacy v2 remains
+available through a read-only compatibility path for inspection and explicit
+`compact` export into a freshly created v3 log.
 
 `LogFs::open` retains buffered compatibility semantics: a successful mutation is
 visible in-process and its root has been flushed, but this does not promise
@@ -48,6 +46,12 @@ which acknowledges them is written and synchronized. A synchronization error
 has an indeterminate durability outcome and taints further writes. Filesystem
 directory-entry durability and hardware which ignores flushes remain platform
 responsibilities.
+
+Use `LogFs::create_new` or `create_new_durable` when initialization must be
+exclusive. `open` never reformats a non-empty region: even when the legacy
+`allow_create` option is enabled, an authentication or format error is returned
+without modifying the bytes. The CLI's `--create` flag is the corresponding
+explicit initialization request.
 
 Only one cooperating writable handle may be open. Multiple readonly handles can
 coexist, but they are snapshots established at open and are not live views.
@@ -63,7 +67,13 @@ For raw devices or files containing other data, `LogFs::open_with_options` can
 bound the log to `region_len` bytes beginning at `LogConfig::offset`. Writes are
 checked incrementally and bytes outside the region are not modified. Formatting
 an existing region is only performed when the backing file ends exactly at the
-configured offset and `allow_create` is enabled.
+configured offset and `allow_create` is enabled. Setting
+`LogOpenOptions::randomize_region` during initialization writes random bytes to
+all otherwise-unused capacity in the bounded region; it requires `region_len`
+and is rejected for existing logs. Ordinary growing encrypted files avoid
+fixed markers and reserved zero gaps, but still reveal total size and growth
+timing. Randomized bounded regions hide unused capacity at the cost of a
+full-region initialization write.
 
 Whole-value hashes are always generated and stored for new values. Routine reads
 skip hash checking by default for throughput; use
@@ -85,6 +95,6 @@ actions at 512 MiB, to reject corrupt length fields before unbounded allocation.
 
 `cargo bench -p logfs --bench reliability --locked` covers 10,000 small writes,
 a 32 MiB write, a full checkpoint, and a hash-verified 32 MiB read. One local
-Linux release run during this change measured 62 ms, 26 ms, 1 ms, and 29 ms
+Linux release run during this change measured 175 ms, 26 ms, 2 ms, and 28 ms
 respectively. These numbers are a regression baseline, not portable throughput
 claims; storage, CPU, and synchronization policy materially affect them.

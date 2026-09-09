@@ -7,6 +7,22 @@ use logfs::{CryptoConfig, KeyMeta, LogConfig};
 
 use clap::Parser;
 
+#[derive(clap::ValueEnum, Clone, Copy, Default)]
+enum CryptoProfileArg {
+    #[default]
+    Standard,
+    LowMemory,
+}
+
+impl From<CryptoProfileArg> for logfs::CryptoProfile {
+    fn from(value: CryptoProfileArg) -> Self {
+        match value {
+            CryptoProfileArg::Standard => Self::Standard,
+            CryptoProfileArg::LowMemory => Self::LowMemory,
+        }
+    }
+}
+
 #[derive(clap::Subcommand, Clone)]
 enum Subcommand {
     /// Display filesystem statistics.
@@ -45,7 +61,7 @@ enum Subcommand {
         match_text: String,
         replacement: String,
     },
-    /// Compat the log into a new location.
+    /// Compact the log into a new location.
     Compact {
         #[clap(long)]
         new_path: String,
@@ -55,6 +71,8 @@ enum Subcommand {
         new_salt: String,
         #[clap(long)]
         new_key_iterations: u32,
+        #[clap(long, value_enum, default_value_t)]
+        new_key_profile: CryptoProfileArg,
         new_offset: Option<u64>,
     },
     Migrate {
@@ -100,6 +118,9 @@ struct Options {
     salt: Option<String>,
     #[clap(long)]
     key_iterations: Option<u32>,
+    /// Out-of-band Argon2id profile for encrypted v3 roots.
+    #[clap(long, value_enum, default_value_t)]
+    key_profile: CryptoProfileArg,
 
     #[clap(long)]
     version: Option<u32>,
@@ -128,6 +149,7 @@ impl Options {
                     .as_ref()
                     .map(|v| NonZeroU32::new(*v).unwrap())
                     .unwrap_or(NonZeroU32::new(100_000).unwrap()),
+                profile: self.key_profile.into(),
             }),
             default_chunk_size: 4_000_000,
             partial_index_write_interval: 100,
@@ -282,6 +304,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
             new_key,
             new_salt,
             new_key_iterations,
+            new_key_profile,
             new_offset,
         } => {
             eprintln!("Opening old database...");
@@ -312,6 +335,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
                     salt: new_salt.into_bytes().into(),
                     iterations: NonZeroU32::new(new_key_iterations)
                         .expect("iterations must be > 0"),
+                    profile: new_key_profile.into(),
                 }),
                 default_chunk_size: 4_000_000,
                 // There is no point in writing intermediate indexes, so set the
@@ -425,7 +449,7 @@ fn run<J: logfs::JournalStore>(opt: Options) -> Result<(), logfs::LogFsError> {
 }
 
 fn main() -> Result<(), logfs::LogFsError> {
-    let opt = Options::parse();
+    let mut opt = Options::parse();
 
     if matches!(opt.cmd, Subcommand::Repair { .. }) && std::env::var_os("RUST_LOG").is_none() {
         // SAFETY: startup is single-threaded and tracing has not initialized yet.
@@ -436,6 +460,19 @@ fn main() -> Result<(), logfs::LogFsError> {
             "could not initialize tracing: {error}"
         )))
     })?;
+
+    if opt.create
+        && !matches!(
+            opt.cmd,
+            Subcommand::Repair { .. } | Subcommand::Compact { .. } | Subcommand::Migrate { .. }
+        )
+    {
+        let config = opt.build_config();
+        drop(logfs::LogFs::<logfs::Journal2>::create_new(config)?);
+        // The command itself performs a normal authenticated open. Disabling
+        // fallback creation closes the path-replacement window between calls.
+        opt.create = false;
+    }
 
     let version = opt.version.unwrap_or(2);
     if version == 2 {

@@ -139,7 +139,7 @@ pub struct KeyIndex {
 pub struct KeyIndexEntryV3 {
     pub key: KeyPath,
     pub sequence_id: SequenceId,
-    pub crypto_domain: Option<u64>,
+    pub entry_nonce: Option<[u8; 24]>,
     pub file_offset: DataOffset,
     pub size: ByteCountU64,
     pub chunk_size: Option<ByteCountU32>,
@@ -235,7 +235,7 @@ bitflags::bitflags! {
 /// Metadata for an entry in the journal.
 ///
 /// This is serialized separately from the JournalAction.
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct JournalEntryHeader {
     /// Offset relative to the start of the configured log region.
     /// Included for consistency checks.
@@ -272,7 +272,7 @@ pub struct JournalEntry {
 /// A "pointer" to a log entry.
 ///
 /// Contains the information required for reading the entry.
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryPointer {
     pub sequence: SequenceId,
     pub offset: Offset,

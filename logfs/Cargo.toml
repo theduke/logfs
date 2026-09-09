@@ -14,14 +14,18 @@ readme.workspace = true
 
 [dependencies]
 backtrace = "0.3"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 bincode = "1.3"
 bitflags = { version = "2.9", features = ["serde"] }
 brotli = "8"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 generic-array = "0.14"
 fs2 = "0.4"
+hmac = "0.13"
+hkdf = "0.13"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
-sha2 = "0.10"
+sha2 = "0.11"
 tracing = "0.1"
 zeroize = "1.5"
 

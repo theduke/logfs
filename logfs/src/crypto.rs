@@ -1,85 +1,148 @@
 use std::num::NonZeroU32;
 
-use ring::{aead, hkdf};
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::{
+    XChaCha20Poly1305, XNonce,
+    aead::{AeadInOut, KeyInit},
+};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use ring::aead;
+use sha2::Sha256;
 
 use crate::{DataOffset, LogFsError, journal::NextEntryOffset};
 
 #[derive(Clone)]
 pub struct CryptoConfig {
+    /// Password used by v3 Argon2id and the legacy-v2 compatibility reader.
     pub key: zeroize::Zeroizing<String>,
+    /// Legacy-v2 PBKDF2 salt. V3 stores independent random salts in its roots.
     pub salt: zeroize::Zeroizing<Vec<u8>>,
+    /// Legacy-v2 PBKDF2 iteration count. V3 uses the selected bounded profile.
     pub iterations: NonZeroU32,
+    /// Named, bounded Argon2id profile used for v3 roots. This is supplied
+    /// out-of-band and is also authenticated inside each root.
+    pub profile: CryptoProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CryptoProfile {
+    /// 64 MiB, three passes, one lane.
+    #[default]
+    Standard,
+    /// 8 MiB, three passes, one lane for memory-constrained deployments.
+    LowMemory,
+}
+
+impl CryptoProfile {
+    fn params(self) -> Params {
+        let memory_kib = match self {
+            Self::Standard => 64 * 1024,
+            Self::LowMemory => 8 * 1024,
+        };
+        Params::new(memory_kib, 3, 1, Some(32))
+            .expect("internal error: fixed Argon2id profile is invalid")
+    }
 }
 
 impl std::fmt::Debug for CryptoConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CryptoConfig")
             .field("key", &"*****")
-            .field("seed", &"*****")
+            .field("salt", &"*****")
             .field("iterations", &"*****")
+            .field("profile", &self.profile)
             .finish()
     }
 }
 
 pub struct Crypto {
-    key: aead::LessSafeKey,
-    master_key: zeroize::Zeroizing<[u8; ring::digest::SHA256_OUTPUT_LEN]>,
+    legacy_key: std::sync::OnceLock<aead::LessSafeKey>,
+    legacy_salt: zeroize::Zeroizing<Vec<u8>>,
+    legacy_iterations: NonZeroU32,
+    password: zeroize::Zeroizing<String>,
+    profile: CryptoProfile,
 }
 
+#[derive(Clone)]
 pub(crate) struct V3Crypto {
-    root_key: aead::LessSafeKey,
-    entry_key: aead::LessSafeKey,
+    root_key: XChaCha20Poly1305,
+    entry_key: XChaCha20Poly1305,
+    checkpoint_key: XChaCha20Poly1305,
+    history_key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct V3RootCrypto {
+    keys: [XChaCha20Poly1305; 2],
 }
 
 impl Crypto {
     pub const EXTRA_PAYLOAD_LEN: usize = 16;
 
     pub fn new(config: CryptoConfig) -> Self {
-        // Derive a via pbkdf2 key derivation.
-        let mut derived_key = [0u8; ring::digest::SHA256_OUTPUT_LEN];
-
-        ring::pbkdf2::derive(
-            ring::pbkdf2::PBKDF2_HMAC_SHA512,
-            config.iterations,
-            config.salt.as_slice(),
-            config.key.as_bytes(),
-            &mut derived_key,
-        );
-
-        // NOTE: this can only fail if the key has an invalid length, for
-        // the chosen algorithm, so it can't actually happen without
-        // a programming mistake (as in: wrong size of `derived_key`).
-        // So .expect() can be used without worries.
-        let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &derived_key)
-            .expect("Internal error: invalid key");
-        let aead_key = aead::LessSafeKey::new(unbound_key);
-
         Self {
-            key: aead_key,
-            master_key: zeroize::Zeroizing::new(derived_key),
+            legacy_key: std::sync::OnceLock::new(),
+            legacy_salt: config.salt,
+            legacy_iterations: config.iterations,
+            password: config.key,
+            profile: config.profile,
         }
     }
 
-    pub(crate) fn v3_crypto(&self, identity: [u8; 16]) -> V3Crypto {
-        V3Crypto {
-            root_key: self.derive_v3_key(identity, b"logfs/v3.1/root"),
-            entry_key: self.derive_v3_key(identity, b"logfs/v3.1/entry"),
-        }
+    fn legacy_key(&self) -> &aead::LessSafeKey {
+        self.legacy_key.get_or_init(|| {
+            let mut derived_key = zeroize::Zeroizing::new([0u8; ring::digest::SHA256_OUTPUT_LEN]);
+            ring::pbkdf2::derive(
+                ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                self.legacy_iterations,
+                self.legacy_salt.as_slice(),
+                self.password.as_bytes(),
+                derived_key.as_mut(),
+            );
+            let unbound_key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, derived_key.as_ref())
+                .expect("internal error: invalid legacy key length");
+            aead::LessSafeKey::new(unbound_key)
+        })
     }
 
-    fn derive_v3_key(&self, identity: [u8; 16], purpose: &'static [u8]) -> aead::LessSafeKey {
-        let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &identity);
-        let prk = salt.extract(self.master_key.as_ref());
-        let info = [purpose];
-        let okm = prk
-            .expand(&info, &aead::CHACHA20_POLY1305)
-            .expect("internal error: invalid v3 HKDF output length");
-        let mut derived = zeroize::Zeroizing::new([0u8; ring::digest::SHA256_OUTPUT_LEN]);
-        okm.fill(derived.as_mut())
-            .expect("internal error: invalid v3 HKDF output length");
-        let key = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, derived.as_ref())
-            .expect("internal error: invalid v3 AEAD key length");
-        aead::LessSafeKey::new(key)
+    pub(crate) fn profile(&self) -> CryptoProfile {
+        self.profile
+    }
+
+    fn v3_root_key(&self, salt: &[u8; 16], slot: u8) -> Result<XChaCha20Poly1305, LogFsError> {
+        let mut password_key = zeroize::Zeroizing::new([0u8; 32]);
+        Argon2::new(Algorithm::Argon2id, Version::V0x13, self.profile.params())
+            .hash_password_into(self.password.as_bytes(), salt, password_key.as_mut())
+            .map_err(|_| LogFsError::new_internal("Could not derive v3 root key"))?;
+        let hkdf = Hkdf::<Sha256>::new(Some(b"logfs/v3/root"), password_key.as_ref());
+        let mut key = zeroize::Zeroizing::new([0u8; 32]);
+        hkdf.expand(&[slot], key.as_mut())
+            .map_err(|_| LogFsError::new_internal("Could not separate v3 root key"))?;
+        Ok(XChaCha20Poly1305::new_from_slice(key.as_ref())
+            .expect("internal error: invalid XChaCha key length"))
+    }
+
+    pub(crate) fn v3_root_crypto(&self, salts: &[[u8; 16]; 2]) -> Result<V3RootCrypto, LogFsError> {
+        Ok(V3RootCrypto {
+            keys: [
+                self.v3_root_key(&salts[0], 0)?,
+                self.v3_root_key(&salts[1], 1)?,
+            ],
+        })
+    }
+
+    pub(crate) fn decrypt_v3_root<'a>(
+        &self,
+        salt: &[u8; 16],
+        slot: u8,
+        nonce: [u8; 24],
+        ciphertext: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], LogFsError> {
+        self.v3_root_key(salt, slot)?
+            .decrypt_in_place(&XNonce::from(nonce), &[slot], ciphertext)
+            .map_err(|_| LogFsError::new_internal("Could not authenticate v3 root"))?;
+        Ok(ciphertext.as_slice())
     }
 
     /// Build the decryption nonce for a `JournalEntry` with the given
@@ -117,7 +180,7 @@ impl Crypto {
         let nonce = Self::build_entry_nonce(sequence);
         let aad = aead::Aad::from(header_data);
         let data = self
-            .key
+            .legacy_key()
             .open_in_place(nonce, aad, buffer)
             .map(|x| &*x)
             .map_err(|_| LogFsError::new_internal("Could not decrypt journal entry"))?;
@@ -137,7 +200,7 @@ impl Crypto {
     ) -> Result<(), LogFsError> {
         let nonce = Self::build_entry_nonce(sequence);
         let aad = aead::Aad::from(header_data);
-        self.key
+        self.legacy_key()
             .seal_in_place_append_tag(nonce, aad, data)
             .map_err(|_| LogFsError::new_internal("Could not encrypt journal entry"))?;
         Ok(())
@@ -161,7 +224,7 @@ impl Crypto {
     ) -> Result<(), LogFsError> {
         let data_nonce = Self::build_data_nonce(sequence, chunk_index)?;
         let aad = aead::Aad::from(aad);
-        self.key
+        self.legacy_key()
             .seal_in_place_append_tag(data_nonce, aad, data)
             .map_err(|_| LogFsError::new_internal("Could not encrypt journal entry"))
     }
@@ -184,7 +247,7 @@ impl Crypto {
     ) -> Result<&'a [u8], LogFsError> {
         let nonce = Self::build_data_nonce(sequence, chunk_index)?;
         let slice = self
-            .key
+            .legacy_key()
             .open_in_place(nonce, aead::Aad::from(aad), data)
             .map_err(|_| LogFsError::new_internal("Could not decrypt data"))?;
         Ok(slice)
@@ -212,109 +275,126 @@ impl Crypto {
         data.truncate(full_length - self.extra_payload_len() as usize);
         Ok(data)
     }
-
-    pub(crate) fn encrypt_with_nonce(
-        &self,
-        nonce: [u8; 12],
-        aad: &[u8],
-        data: &mut Vec<u8>,
-    ) -> Result<(), LogFsError> {
-        self.key
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(aad),
-                data,
-            )
-            .map_err(|_| LogFsError::new_internal("Could not encrypt v3 root"))
-    }
-
-    pub(crate) fn decrypt_with_nonce<'a>(
-        &self,
-        nonce: [u8; 12],
-        aad: &[u8],
-        data: &'a mut [u8],
-    ) -> Result<&'a [u8], LogFsError> {
-        self.key
-            .open_in_place(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(aad),
-                data,
-            )
-            .map(|data| &*data)
-            .map_err(|_| LogFsError::new_internal("Could not decrypt v3 root"))
-    }
 }
 
 impl V3Crypto {
-    pub(crate) fn encrypt_root(
-        &self,
-        nonce: [u8; 12],
+    pub(crate) fn new(log_secret: &[u8; 32]) -> Self {
+        fn expand(secret: &[u8; 32], context: &[u8]) -> [u8; 32] {
+            let hkdf = Hkdf::<Sha256>::new(Some(b"logfs/v3/log-secret"), secret);
+            let mut key = [0u8; 32];
+            hkdf.expand(context, &mut key)
+                .expect("internal error: valid HKDF output length");
+            key
+        }
+        let entry = zeroize::Zeroizing::new(expand(log_secret, b"entry"));
+        let root = zeroize::Zeroizing::new(expand(log_secret, b"root"));
+        let checkpoint = zeroize::Zeroizing::new(expand(log_secret, b"checkpoint"));
+        Self {
+            root_key: XChaCha20Poly1305::new_from_slice(root.as_ref())
+                .expect("internal error: invalid root key length"),
+            entry_key: XChaCha20Poly1305::new_from_slice(entry.as_ref())
+                .expect("internal error: invalid entry key length"),
+            checkpoint_key: XChaCha20Poly1305::new_from_slice(checkpoint.as_ref())
+                .expect("internal error: invalid checkpoint key length"),
+            history_key: zeroize::Zeroizing::new(expand(log_secret, b"history")),
+        }
+    }
+
+    fn encrypt_with(
+        key: &XChaCha20Poly1305,
+        nonce: [u8; 24],
         aad: &[u8],
         data: &mut Vec<u8>,
     ) -> Result<(), LogFsError> {
-        self.root_key
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(aad),
-                data,
-            )
-            .map_err(|_| LogFsError::new_internal("Could not encrypt v3 root"))
+        key.encrypt_in_place(&XNonce::from(nonce), aad, data)
+            .map_err(|_| LogFsError::new_internal("Could not encrypt v3 record"))
     }
 
-    pub(crate) fn decrypt_root<'a>(
-        &self,
-        nonce: [u8; 12],
+    fn decrypt_with<'a>(
+        key: &XChaCha20Poly1305,
+        nonce: [u8; 24],
         aad: &[u8],
-        data: &'a mut [u8],
+        data: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], LogFsError> {
-        self.root_key
-            .open_in_place(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(aad),
-                data,
-            )
-            .map(|data| &*data)
-            .map_err(|_| LogFsError::new_internal("Could not decrypt v3 root"))
+        key.decrypt_in_place(&XNonce::from(nonce), aad, data)
+            .map_err(|_| LogFsError::new_internal("Could not authenticate v3 record"))?;
+        Ok(data.as_slice())
     }
 
     pub(crate) fn encrypt_entry(
         &self,
-        domain: u64,
-        chunk: u32,
+        nonce: [u8; 24],
         aad: &[u8],
         data: &mut Vec<u8>,
     ) -> Result<(), LogFsError> {
-        let nonce = Crypto::build_data_nonce(domain, chunk)?;
-        self.entry_key
-            .seal_in_place_append_tag(nonce, aead::Aad::from(aad), data)
-            .map_err(|_| LogFsError::new_internal("Could not encrypt v3 entry"))
+        Self::encrypt_with(&self.entry_key, nonce, aad, data)
     }
 
-    pub(crate) fn decrypt_entry_ref<'a>(
+    pub(crate) fn encrypt_root(
         &self,
-        domain: u64,
-        chunk: u32,
+        nonce: [u8; 24],
         aad: &[u8],
-        data: &'a mut [u8],
+        data: &mut Vec<u8>,
+    ) -> Result<(), LogFsError> {
+        Self::encrypt_with(&self.root_key, nonce, aad, data)
+    }
+
+    pub(crate) fn decrypt_root<'a>(
+        &self,
+        nonce: [u8; 24],
+        aad: &[u8],
+        data: &'a mut Vec<u8>,
     ) -> Result<&'a [u8], LogFsError> {
-        let nonce = Crypto::build_data_nonce(domain, chunk)?;
-        self.entry_key
-            .open_in_place(nonce, aead::Aad::from(aad), data)
-            .map(|data| &*data)
-            .map_err(|_| LogFsError::new_internal("Could not decrypt v3 entry"))
+        Self::decrypt_with(&self.root_key, nonce, aad, data)
     }
 
-    pub(crate) fn decrypt_entry(
+    pub(crate) fn decrypt_entry<'a>(
         &self,
-        domain: u64,
-        chunk: u32,
+        nonce: [u8; 24],
         aad: &[u8],
-        mut data: Vec<u8>,
-    ) -> Result<Vec<u8>, LogFsError> {
-        let full_length = data.len();
-        self.decrypt_entry_ref(domain, chunk, aad, &mut data)?;
-        data.truncate(full_length - Crypto::EXTRA_PAYLOAD_LEN);
-        Ok(data)
+        data: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], LogFsError> {
+        Self::decrypt_with(&self.entry_key, nonce, aad, data)
+    }
+
+    pub(crate) fn encrypt_checkpoint(
+        &self,
+        nonce: [u8; 24],
+        aad: &[u8],
+        data: &mut Vec<u8>,
+    ) -> Result<(), LogFsError> {
+        Self::encrypt_with(&self.checkpoint_key, nonce, aad, data)
+    }
+
+    pub(crate) fn decrypt_checkpoint<'a>(
+        &self,
+        nonce: [u8; 24],
+        aad: &[u8],
+        data: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8], LogFsError> {
+        Self::decrypt_with(&self.checkpoint_key, nonce, aad, data)
+    }
+
+    pub(crate) fn commit_history(&self, fields: &[&[u8]]) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(self.history_key.as_ref())
+            .expect("internal error: valid HMAC key length");
+        for field in fields {
+            mac.update(field);
+        }
+        mac.finalize().into_bytes().into()
+    }
+}
+
+impl V3RootCrypto {
+    pub(crate) fn encrypt(
+        &self,
+        slot: usize,
+        nonce: [u8; 24],
+        data: &mut Vec<u8>,
+    ) -> Result<(), LogFsError> {
+        self.keys[slot]
+            .encrypt_in_place(&XNonce::from(nonce), &[slot as u8], data)
+            .map_err(|_| LogFsError::new_internal("Could not encrypt v3 root"))
     }
 }
 
@@ -322,33 +402,24 @@ impl V3Crypto {
 mod tests {
     use super::*;
 
-    fn crypto() -> Crypto {
-        Crypto::new(CryptoConfig {
-            key: "password".to_owned().into(),
-            salt: b"salt".to_vec().into(),
-            iterations: NonZeroU32::new(1).unwrap(),
-        })
-    }
-
     #[test]
     fn v3_keys_are_separated_by_file_and_purpose() {
-        let crypto = crypto();
-        let first = crypto.v3_crypto([1; 16]);
-        let second = crypto.v3_crypto([2; 16]);
-        let mut nonce = [0; 12];
-        nonce[..8].copy_from_slice(&7u64.to_le_bytes());
-        nonce[8..].copy_from_slice(&2u32.to_le_bytes());
+        let first = V3Crypto::new(&[1; 32]);
+        let second = V3Crypto::new(&[2; 32]);
+        let nonce = [7; 24];
         let aad = b"authenticated framing";
 
         let mut first_entry = b"same plaintext".to_vec();
-        first.encrypt_entry(7, 2, aad, &mut first_entry).unwrap();
+        first.encrypt_entry(nonce, aad, &mut first_entry).unwrap();
         let mut second_entry = b"same plaintext".to_vec();
-        second.encrypt_entry(7, 2, aad, &mut second_entry).unwrap();
+        second.encrypt_entry(nonce, aad, &mut second_entry).unwrap();
         assert_ne!(first_entry, second_entry);
 
-        let mut root = b"same plaintext".to_vec();
-        first.encrypt_root(nonce, aad, &mut root).unwrap();
-        assert_ne!(first_entry, root);
-        assert!(second.decrypt_entry(7, 2, aad, first_entry).is_err());
+        let mut checkpoint = b"same plaintext".to_vec();
+        first
+            .encrypt_checkpoint(nonce, aad, &mut checkpoint)
+            .unwrap();
+        assert_ne!(first_entry, checkpoint);
+        assert!(second.decrypt_entry(nonce, aad, &mut first_entry).is_err());
     }
 }

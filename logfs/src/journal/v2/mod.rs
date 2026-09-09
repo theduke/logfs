@@ -32,15 +32,15 @@ struct PersistedEntry {
     entry: data::JournalEntry,
     /// The offset where the entry data starts.
     file_data_offset: data::Offset,
-    crypto_domain: Option<u64>,
+    entry_nonce: Option<[u8; 24]>,
     log_identity: Option<[u8; 16]>,
-    derived_crypto: bool,
 }
 
 pub struct Journal2 {
     path: std::path::PathBuf,
     _tainted: write::TaintedFlag,
     crypto: Option<Arc<Crypto>>,
+    v3_crypto: Option<Arc<crate::crypto::V3Crypto>>,
     state: Arc<State>,
     default_chunk_size: u32,
     readonly: bool,
@@ -181,34 +181,28 @@ fn find_entry_header_in_slice(
 
 fn find_v3_entry_header_in_slice(
     crypto: Option<&Crypto>,
-    derived_crypto: Option<&crate::crypto::V3Crypto>,
+    v3_crypto: Option<&crate::crypto::V3Crypto>,
     identity: [u8; 16],
     sequence: SequenceId,
     bytes: &[u8],
     buffer_file_offset: u64,
     base_offset: u64,
-) -> Option<(data::JournalEntryHeader, Offset, u64)> {
-    let encrypted_header_len = data::JournalEntryHeader::SERIALIZED_LEN
+) -> Option<(data::JournalEntryHeader, Offset, [u8; 24])> {
+    let encrypted_header_len = V3_FRAME_HEADER_CLEAR_LEN
         + crypto
             .map(|value| value.extra_payload_len() as usize)
             .unwrap_or(V3_PLAIN_METADATA_CHECKSUM_LEN);
-    let candidate_len = 8usize.checked_add(encrypted_header_len)?;
+    let candidate_len = 24usize.checked_add(encrypted_header_len)?;
     if bytes.len() < candidate_len {
         return None;
     }
     for index in 0..=bytes.len() - candidate_len {
-        let domain = u64::from_le_bytes(bytes[index..index + 8].try_into().ok()?);
-        let mut header_bytes = bytes[index + 8..index + candidate_len].to_vec();
-        let aad = v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
-        let clear = if let Some(crypto) = derived_crypto {
-            match crypto.decrypt_entry_ref(domain, ENTRY_HEADER_CHUNK, &aad, &mut header_bytes) {
-                Ok(clear) => clear,
-                Err(_) => continue,
-            }
-        } else if let Some(crypto) = crypto {
-            match crypto.decrypt_data_ref_with_aad(
-                domain,
-                ENTRY_HEADER_CHUNK,
+        let entry_nonce: [u8; 24] = bytes[index..index + 24].try_into().ok()?;
+        let mut header_bytes = bytes[index + 24..index + candidate_len].to_vec();
+        let aad = v3_aad(identity, entry_nonce, ENTRY_HEADER_CHUNK);
+        let clear = if let Some(crypto) = v3_crypto {
+            match crypto.decrypt_entry(
+                v3_nonce(entry_nonce, ENTRY_HEADER_CHUNK),
                 &aad,
                 &mut header_bytes,
             ) {
@@ -221,7 +215,8 @@ fn find_v3_entry_header_in_slice(
                 Err(_) => continue,
             }
         };
-        if let Ok(header) = bincode::deserialize::<data::JournalEntryHeader>(clear)
+        if let Ok(frame) = decode_v3_frame_header(clear)
+            && let header = frame.header
             && header.sequence_id == sequence
             && !header
                 .flags
@@ -231,7 +226,7 @@ fn find_v3_entry_header_in_slice(
                     .checked_add(index as u64)?
                     .checked_sub(base_offset)?
         {
-            return Some((header, index as u64, domain));
+            return Some((header, index as u64, entry_nonce));
         }
     }
     None
@@ -333,28 +328,29 @@ fn read_v3_entry(
     reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
     crypto: Option<&Crypto>,
-    derived_crypto: Option<&crate::crypto::V3Crypto>,
+    v3_crypto: Option<&crate::crypto::V3Crypto>,
     identity: [u8; 16],
     sequence: SequenceId,
-) -> Result<(data::JournalEntry, u64), LogFsError> {
-    let mut domain_bytes = [0u8; 8];
-    reader.read_exact(&mut domain_bytes)?;
-    let domain = u64::from_le_bytes(domain_bytes);
-    let header_size = data::JournalEntryHeader::SERIALIZED_LEN
+) -> Result<(data::JournalEntry, [u8; 24]), LogFsError> {
+    let mut entry_nonce = [0u8; 24];
+    reader.read_exact(&mut entry_nonce)?;
+    let header_size = V3_FRAME_HEADER_CLEAR_LEN
         + crypto
             .map(|value| value.extra_payload_len() as usize)
             .unwrap_or(V3_PLAIN_METADATA_CHECKSUM_LEN);
     buffer.resize(header_size, 0);
     reader.read_exact(buffer)?;
-    let header_aad = v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
-    let header_bytes = if let Some(crypto) = derived_crypto {
-        crypto.decrypt_entry_ref(domain, ENTRY_HEADER_CHUNK, &header_aad, buffer)?
-    } else if let Some(crypto) = crypto {
-        crypto.decrypt_data_ref_with_aad(domain, ENTRY_HEADER_CHUNK, &header_aad, buffer)?
+    let header_aad = v3_aad(identity, entry_nonce, ENTRY_HEADER_CHUNK);
+    let header_bytes = if let Some(crypto) = v3_crypto {
+        crypto.decrypt_entry(
+            v3_nonce(entry_nonce, ENTRY_HEADER_CHUNK),
+            &header_aad,
+            buffer,
+        )?
     } else {
         verify_plain_metadata_checksum(buffer, &header_aad)?
     };
-    let header: data::JournalEntryHeader = bincode::deserialize(header_bytes)?;
+    let header = decode_v3_frame_header(header_bytes)?.header;
     if header.sequence_id != sequence {
         return Err(LogFsError::new_internal(
             "Recovered v3 entry has an unexpected sequence",
@@ -364,21 +360,21 @@ fn read_v3_entry(
         reader,
         buffer,
         crypto,
-        derived_crypto,
+        v3_crypto,
         &header,
-        domain,
+        entry_nonce,
         identity,
     )?;
-    Ok((data::JournalEntry { header, action }, domain))
+    Ok((data::JournalEntry { header, action }, entry_nonce))
 }
 
 fn read_entry_action_with_domain(
     reader: &mut impl io::Read,
     buffer: &mut Vec<u8>,
-    crypto: Option<&Crypto>,
-    derived_crypto: Option<&crate::crypto::V3Crypto>,
+    _crypto: Option<&Crypto>,
+    v3_crypto: Option<&crate::crypto::V3Crypto>,
     header: &data::JournalEntryHeader,
-    domain: u64,
+    entry_nonce: [u8; 24],
     identity: [u8; 16],
 ) -> Result<data::JournalAction, LogFsError> {
     let action_size = header.action_size as usize;
@@ -389,11 +385,9 @@ fn read_entry_action_with_domain(
     }
     buffer.resize(action_size, 0);
     reader.read_exact(buffer)?;
-    let aad = v3_aad(identity, domain, ENTRY_ACTION_CHUNK);
-    let bytes = if let Some(crypto) = derived_crypto {
-        crypto.decrypt_entry_ref(domain, ENTRY_ACTION_CHUNK, &aad, buffer)?
-    } else if let Some(crypto) = crypto {
-        crypto.decrypt_data_ref_with_aad(domain, ENTRY_ACTION_CHUNK, &aad, buffer)?
+    let aad = v3_aad(identity, entry_nonce, ENTRY_ACTION_CHUNK);
+    let bytes = if let Some(crypto) = v3_crypto {
+        crypto.decrypt_entry(v3_nonce(entry_nonce, ENTRY_ACTION_CHUNK), &aad, buffer)?
     } else {
         verify_plain_metadata_checksum(buffer, &aad)?
     };
@@ -422,7 +416,7 @@ fn validate_restored_pointer<R: io::Read + io::Seek>(
     file_offset: u64,
     size: u64,
     chunk_size: Option<u32>,
-    crypto_domain: Option<u64>,
+    entry_nonce: Option<[u8; 24]>,
 ) -> Result<(), LogFsError> {
     if sequence >= checkpoint.sequence {
         return Err(LogFsError::new_internal(
@@ -434,7 +428,7 @@ fn validate_restored_pointer<R: io::Read + io::Seek>(
             "Checkpoint contains a zero chunk size",
         ));
     }
-    let chunks = if size == 0 && crypto_domain.is_none() {
+    let chunks = if size == 0 && entry_nonce.is_none() {
         0
     } else if let Some(chunk) = chunk_size {
         let count = size.div_ceil(chunk as u64);
@@ -584,9 +578,8 @@ fn restore_index<R: io::Read + io::Seek>(
                         size: item.size,
                         chunk_size: item.chunk_size,
                         hash: None,
-                        crypto_domain: None,
+                        entry_nonce: None,
                         log_identity: None,
-                        derived_crypto: false,
                     });
                 }
             }
@@ -616,11 +609,11 @@ fn restore_index<R: io::Read + io::Seek>(
                         item.file_offset,
                         item.size,
                         item.chunk_size,
-                        item.crypto_domain,
+                        item.entry_nonce,
                     )?;
-                    if item.crypto_domain.is_none() {
+                    if item.entry_nonce.is_none() {
                         return Err(LogFsError::new_internal(
-                            "V3 checkpoint key is missing its nonce domain",
+                            "V3 checkpoint key is missing its entry nonce",
                         ));
                     }
                     if tree
@@ -632,9 +625,8 @@ fn restore_index<R: io::Read + io::Seek>(
                                 size: item.size,
                                 chunk_size: item.chunk_size,
                                 hash: item.hash.map(|hash| hash.0),
-                                crypto_domain: item.crypto_domain,
+                                entry_nonce: item.entry_nonce,
                                 log_identity: reader.v3_identity(),
-                                derived_crypto: reader.uses_derived_crypto(),
                             },
                         )
                         .is_some()
@@ -665,7 +657,7 @@ impl Journal2 {
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
     ) -> Result<Self, LogFsError> {
-        Self::open_with_region(path, tree, crypto, config, None)
+        Self::open_with_region(path, tree, crypto, config, None, false)
     }
 
     pub(crate) fn create_new_exclusive(
@@ -673,6 +665,8 @@ impl Journal2 {
         _tree: SharedTree,
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
+        region_len: Option<u64>,
+        randomize_region: bool,
     ) -> Result<Self, LogFsError> {
         if config.readonly {
             return Err(LogFsError::ReadOnly);
@@ -705,16 +699,17 @@ impl Journal2 {
         }
         let tainted = write::TaintedFlag::new();
         let durable = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut writer = LogWriter::create_new(
+        let writer = LogWriter::create_new(
             crypto.clone(),
             tainted.clone(),
             file,
             config.offset.unwrap_or_default(),
             durable.clone(),
-            None,
+            region_len,
+            randomize_region,
         )?;
-        writer.begin_write_session()?;
         let backing = Arc::new(read::BackingFile::new(writer.backing_clone()?));
+        let v3_crypto = writer.v3_crypto().map(Arc::new);
         Ok(Self {
             state: Arc::new(State {
                 writer: std::sync::Mutex::new(WriterState::Available(Some(Box::new(writer)))),
@@ -723,6 +718,7 @@ impl Journal2 {
             }),
             _tainted: tainted,
             crypto,
+            v3_crypto,
             path,
             default_chunk_size: config.default_chunk_size,
             readonly: false,
@@ -739,6 +735,7 @@ impl Journal2 {
         crypto: Option<Arc<Crypto>>,
         config: &LogConfig,
         region_len: Option<u64>,
+        randomize_region: bool,
     ) -> Result<Self, LogFsError> {
         if config.default_chunk_size == 0 {
             return Err(LogFsError::new_internal(
@@ -765,7 +762,7 @@ impl Journal2 {
 
         let tainted = write::TaintedFlag::new();
         let durable = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut writer = if let Some(mut file) = existing_file {
+        let writer = if let Some(mut file) = existing_file {
             if config.readonly {
                 fs2::FileExt::try_lock_shared(&file).map_err(|error| {
                     LogFsError::new_internal(format!("Could not acquire shared log lock: {error}"))
@@ -822,8 +819,14 @@ impl Journal2 {
                     config.offset.unwrap_or_default(),
                     durable.clone(),
                     region_len,
+                    randomize_region,
                 )?
             } else {
+                if randomize_region {
+                    return Err(LogFsError::new_internal(
+                        "Randomized preallocation is only valid while initializing an empty region",
+                    ));
+                }
                 let mut state = tree.write().unwrap();
 
                 Self::open_existing(
@@ -864,16 +867,15 @@ impl Journal2 {
                 config.offset.unwrap_or_default(),
                 durable.clone(),
                 region_len,
+                randomize_region,
             )?
         };
-        if !config.readonly {
-            writer.begin_write_session()?;
-        }
-
+        let readonly = config.readonly || writer.is_legacy_v2();
         // Clone the already-opened object and use positional reads. This stays
         // attached to the same object if its pathname is renamed or replaced,
         // without sharing a logical seek cursor with readers or the writer.
         let backing = Arc::new(read::BackingFile::new(writer.backing_clone()?));
+        let v3_crypto = writer.v3_crypto().map(Arc::new);
 
         let j = Self {
             state: Arc::new(State {
@@ -883,9 +885,10 @@ impl Journal2 {
             }),
             _tainted: tainted,
             crypto,
+            v3_crypto,
             path,
             default_chunk_size: config.default_chunk_size,
-            readonly: config.readonly,
+            readonly,
             checkpoint_interval: config.full_index_write_interval,
             backing,
             durable,
@@ -1058,9 +1061,8 @@ impl Journal2 {
             size,
             chunk_size: chunk_size_opt,
             hash: Some(hash.into()),
-            crypto_domain: entry.crypto_domain,
+            entry_nonce: entry.entry_nonce,
             log_identity: entry.log_identity,
-            derived_crypto: entry.derived_crypto,
         })
     }
 
@@ -1103,6 +1105,7 @@ impl Journal2 {
     pub fn read_data(&self, pointer: &KeyPointer) -> Result<Vec<u8>, LogFsError> {
         let reader = read::KeyDataReader::new_shared(
             self.crypto.clone(),
+            self.v3_crypto.clone(),
             pointer,
             self.backing.clone(),
             self.verify_reads.load(std::sync::atomic::Ordering::Relaxed),
@@ -1118,6 +1121,7 @@ impl Journal2 {
     fn verify_data(&self, pointer: &KeyPointer) -> Result<bool, LogFsError> {
         let reader = read::KeyDataReader::new_shared(
             self.crypto.clone(),
+            self.v3_crypto.clone(),
             pointer,
             self.backing.clone(),
             true,
@@ -1129,6 +1133,7 @@ impl Journal2 {
     fn reader(&self, pointer: &KeyPointer) -> Result<read::StdKeyReader, LogFsError> {
         let reader = read::KeyDataReader::new_shared(
             self.crypto.clone(),
+            self.v3_crypto.clone(),
             pointer,
             self.backing.clone(),
             self.verify_reads.load(std::sync::atomic::Ordering::Relaxed),
@@ -1139,6 +1144,7 @@ impl Journal2 {
     fn chunk_iter(&self, pointer: &KeyPointer) -> Result<read::KeyChunkIter, LogFsError> {
         let reader = read::KeyDataReader::new_shared(
             self.crypto.clone(),
+            self.v3_crypto.clone(),
             pointer,
             self.backing.clone(),
             self.verify_reads.load(std::sync::atomic::Ordering::Relaxed),
@@ -1189,9 +1195,8 @@ fn apply_entry(state: &mut crate::state::State, entry: PersistedEntry) -> Result
                     size: key.size,
                     chunk_size: key.chunk_size,
                     hash: Some(key.hash.0),
-                    crypto_domain: entry.crypto_domain,
+                    entry_nonce: entry.entry_nonce,
                     log_identity: entry.log_identity,
-                    derived_crypto: entry.derived_crypto,
                 },
             )
         }
@@ -1247,39 +1252,110 @@ struct IndexedSuperBlock {
     format: RootFormat,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum V3CryptoSuite {
-    Legacy,
-    DerivedKeys,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum RootFormat {
     LegacyV2,
     V3 {
         identity: [u8; 16],
         generation: u64,
-        last_nonce_domain: u64,
-        crypto_suite: V3CryptoSuite,
+        log_secret: zeroize::Zeroizing<[u8; 32]>,
+        root_salts: [[u8; 16]; 2],
+        history: [u8; 32],
+        checkpoint_history: [u8; 32],
     },
 }
 
-const V3_ROOT_MAGIC: [u8; 8] = *b"LOGFS3R\0";
+impl std::fmt::Debug for RootFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LegacyV2 => formatter.write_str("LegacyV2"),
+            Self::V3 {
+                identity,
+                generation,
+                history,
+                checkpoint_history,
+                ..
+            } => formatter
+                .debug_struct("V3")
+                .field("identity", identity)
+                .field("generation", generation)
+                .field("log_secret", &"*****")
+                .field("root_salts", &"*****")
+                .field("history", history)
+                .field("checkpoint_history", checkpoint_history)
+                .finish(),
+        }
+    }
+}
+
+const V3_INNER_MAGIC: [u8; 16] = *b"LOGFS-OPAQUE-V3\0";
 const V3_ROOT_SLOT_SIZE: u64 = 4096;
 const V3_ROOT_COUNT: u64 = 2;
 pub(crate) const V3_HEADER_SIZE: u64 = V3_ROOT_SLOT_SIZE * V3_ROOT_COUNT;
 const V3_ROOT_RECORD_LEN: usize = V3_ROOT_SLOT_SIZE as usize;
-const V3_ROOT_MAGIC_COPY_OFFSET: usize = V3_ROOT_RECORD_LEN - V3_ROOT_MAGIC.len();
-const V3_ROOT_PREFIX_LEN: usize = 60;
-const V3_ROOT_FLAG_ENCRYPTED: u8 = 1;
-const V3_ROOT_FLAG_DERIVED_KEYS: u8 = 1 << 1;
+const V3_ROOT_SALT_LEN: usize = 16;
+const V3_NONCE_LEN: usize = 24;
+const V3_ROOT_OUTER_LEN: usize = V3_ROOT_SALT_LEN + V3_NONCE_LEN;
+const V3_ROOT_CLEAR_LEN: usize = V3_ROOT_RECORD_LEN - V3_ROOT_OUTER_LEN - Crypto::EXTRA_PAYLOAD_LEN;
 const V3_PLAIN_METADATA_CHECKSUM_LEN: usize = 32;
+const V3_FRAME_HEADER_CLEAR_LEN: usize = 256;
 
-fn v3_aad(identity: [u8; 16], domain: u64, chunk: data::ChunkIndex) -> [u8; 28] {
-    let mut aad = [0u8; 28];
+#[derive(serde::Serialize, serde::Deserialize)]
+struct V3FrameHeader {
+    header: data::JournalEntryHeader,
+    previous_history: [u8; 32],
+    history: [u8; 32],
+}
+
+fn decode_v3_frame_header(bytes: &[u8]) -> Result<V3FrameHeader, LogFsError> {
+    let encoded_len = u32::from_le_bytes(
+        bytes
+            .get(..4)
+            .ok_or_else(|| LogFsError::new_internal("Truncated v3 frame header"))?
+            .try_into()
+            .map_err(|_| LogFsError::new_internal("Truncated v3 frame header"))?,
+    ) as usize;
+    if encoded_len == 0 || encoded_len > bytes.len().saturating_sub(4) {
+        return Err(LogFsError::new_internal("Invalid v3 frame header length"));
+    }
+    Ok(bincode::deserialize(&bytes[4..4 + encoded_len])?)
+}
+
+fn v3_history_commit(
+    crypto: Option<&crate::crypto::V3Crypto>,
+    previous: [u8; 32],
+    identity: [u8; 16],
+    entry_nonce: [u8; 24],
+    action: &[u8],
+) -> [u8; 32] {
+    if let Some(crypto) = crypto {
+        crypto.commit_history(&[&previous, &identity, &entry_nonce, action])
+    } else {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"logfs/v3/plain-history");
+        hasher.update(previous);
+        hasher.update(identity);
+        hasher.update(entry_nonce);
+        hasher.update(action);
+        hasher.finalize().into()
+    }
+}
+
+fn v3_nonce(mut entry_nonce: [u8; 24], chunk: data::ChunkIndex) -> [u8; 24] {
+    let random_suffix = u32::from_le_bytes(
+        entry_nonce[20..]
+            .try_into()
+            .expect("v3 nonce suffix is four bytes"),
+    );
+    entry_nonce[20..].copy_from_slice(&(random_suffix ^ chunk).to_le_bytes());
+    entry_nonce
+}
+
+fn v3_aad(identity: [u8; 16], entry_nonce: [u8; 24], chunk: data::ChunkIndex) -> [u8; 44] {
+    let mut aad = [0u8; 44];
     aad[..16].copy_from_slice(&identity);
-    aad[16..24].copy_from_slice(&domain.to_le_bytes());
-    aad[24..].copy_from_slice(&chunk.to_le_bytes());
+    aad[16..40].copy_from_slice(&entry_nonce);
+    aad[40..].copy_from_slice(&chunk.to_le_bytes());
     aad
 }
 
@@ -1306,14 +1382,8 @@ fn verify_plain_metadata_checksum<'a>(bytes: &'a [u8], aad: &[u8]) -> Result<&'a
     Ok(data)
 }
 
-fn v3_alignment_padding(base_offset: u64) -> u64 {
-    (V3_ROOT_SLOT_SIZE - base_offset % V3_ROOT_SLOT_SIZE) % V3_ROOT_SLOT_SIZE
-}
-
-fn v3_entry_start(base_offset: u64) -> Result<u64, LogFsError> {
-    v3_alignment_padding(base_offset)
-        .checked_add(V3_HEADER_SIZE)
-        .ok_or_else(|| LogFsError::new_internal("V3 root area offset overflow"))
+fn v3_entry_start(_base_offset: u64) -> Result<u64, LogFsError> {
+    Ok(V3_HEADER_SIZE)
 }
 
 impl RootFormat {
@@ -1324,19 +1394,15 @@ impl RootFormat {
         }
     }
 
-    fn root_offset(&self, base_offset: u64, index: usize) -> Result<u64, LogFsError> {
+    fn root_offset(&self, _base_offset: u64, index: usize) -> Result<u64, LogFsError> {
         let index = u64::try_from(index)
             .map_err(|_| LogFsError::new_internal("Root slot index overflow"))?;
         match self {
             Self::LegacyV2 => index
                 .checked_mul(data::Superblock::SERIALIZED_LEN)
                 .ok_or_else(|| LogFsError::new_internal("Root slot offset overflow")),
-            Self::V3 { .. } => v3_alignment_padding(base_offset)
-                .checked_add(
-                    index
-                        .checked_mul(V3_ROOT_SLOT_SIZE)
-                        .ok_or_else(|| LogFsError::new_internal("Root slot offset overflow"))?,
-                )
+            Self::V3 { .. } => index
+                .checked_mul(V3_ROOT_SLOT_SIZE)
                 .ok_or_else(|| LogFsError::new_internal("Root slot offset overflow")),
         }
     }
@@ -1344,8 +1410,17 @@ impl RootFormat {
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct V3RootPayload {
+    magic: [u8; 16],
+    version: u32,
+    profile: crate::CryptoProfile,
+    identity: [u8; 16],
+    slot: u8,
+    generation: u64,
     block: data::Superblock,
-    last_nonce_domain: u64,
+    log_secret: [u8; 32],
+    root_salts: [[u8; 16]; 2],
+    history: [u8; 32],
+    checkpoint_history: [u8; 32],
 }
 
 impl super::JournalStore for Journal2 {

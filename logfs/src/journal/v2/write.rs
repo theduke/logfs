@@ -8,7 +8,7 @@ use sha2::Digest;
 
 use crate::{
     KeyLock, LogFsError,
-    crypto::Crypto,
+    crypto::{Crypto, V3Crypto, V3RootCrypto},
     journal::{
         SequenceId,
         v2::{ENTRY_ACTION_CHUNK, ENTRY_HEADER_CHUNK, data::EntryPointer},
@@ -31,17 +31,11 @@ pub(crate) const FAIL_ROOT_SYNC: u8 = 6;
 #[cfg(test)]
 thread_local! {
     static TEST_FAIL_POINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-    static TEST_LEGACY_V3_SUITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
 pub(crate) fn inject_next_io_failure(point: u8) {
     TEST_FAIL_POINT.with(|value| value.set(point));
-}
-
-#[cfg(test)]
-pub(crate) fn use_legacy_v3_suite_for_next_open(enabled: bool) {
-    TEST_LEGACY_V3_SUITE.with(|value| value.set(enabled));
 }
 
 fn maybe_fail_io(point: u8) -> std::io::Result<()> {
@@ -83,7 +77,8 @@ pub(crate) struct LogWriter {
     base_offset: u64,
 
     crypto: Option<Arc<Crypto>>,
-    v3_crypto: Option<crate::crypto::V3Crypto>,
+    v3_crypto: Option<V3Crypto>,
+    v3_root_crypto: Option<V3RootCrypto>,
     next_sequence: SequenceId,
     offset: data::Offset,
     writer: BufWriter<std::fs::File>,
@@ -96,7 +91,8 @@ pub(crate) struct LogWriter {
     actions_since_last_index_write: u64,
 
     last_written_index: Option<data::EntryPointer>,
-    current_crypto_domain: Option<u64>,
+    current_entry_nonce: Option<[u8; 24]>,
+    current_entry_is_checkpoint: bool,
     durable: Arc<AtomicBool>,
     region_len: Option<u64>,
 }
@@ -118,7 +114,7 @@ impl std::fmt::Debug for LogWriter {
                 &self.actions_since_last_index_write,
             )
             .field("last_written_index", &self.last_written_index)
-            .field("current_crypto_domain", &self.current_crypto_domain)
+            .field("current_entry_nonce", &self.current_entry_nonce)
             .finish()
     }
 }
@@ -160,6 +156,14 @@ impl LogWriter {
         &self.active_superblock
     }
 
+    pub(super) fn v3_crypto(&self) -> Option<V3Crypto> {
+        self.v3_crypto.clone()
+    }
+
+    pub(super) fn is_legacy_v2(&self) -> bool {
+        matches!(self.active_superblock.format, super::RootFormat::LegacyV2)
+    }
+
     pub(crate) fn create_new(
         crypto: Option<Arc<Crypto>>,
         tainted: TaintedFlag,
@@ -167,6 +171,7 @@ impl LogWriter {
         base_offset: u64,
         durable: Arc<AtomicBool>,
         region_len: Option<u64>,
+        randomize_region: bool,
     ) -> Result<Self, LogFsError> {
         let v3_entry_start = super::v3_entry_start(base_offset)?;
         if region_len.is_some_and(|limit| limit < v3_entry_start) {
@@ -174,31 +179,38 @@ impl LogWriter {
                 "Configured region is smaller than the v3 root area",
             ));
         }
+        if randomize_region && region_len.is_none() {
+            return Err(LogFsError::new_internal(
+                "Randomized preallocation requires a bounded region length",
+            ));
+        }
         let random = ring::rand::SystemRandom::new();
         let mut identity = [0u8; 16];
+        let mut log_secret = zeroize::Zeroizing::new([0u8; 32]);
+        let mut root_salts = [[0u8; 16]; 2];
         random
             .fill(&mut identity)
             .map_err(|_| LogFsError::new_internal("Could not generate v3 log identity"))?;
-        #[cfg(test)]
-        let crypto_suite = TEST_LEGACY_V3_SUITE.with(|value| {
-            if value.replace(false) {
-                super::V3CryptoSuite::Legacy
-            } else {
-                super::V3CryptoSuite::DerivedKeys
-            }
-        });
-        #[cfg(not(test))]
-        let crypto_suite = super::V3CryptoSuite::DerivedKeys;
+        random
+            .fill(log_secret.as_mut())
+            .map_err(|_| LogFsError::new_internal("Could not generate v3 log secret"))?;
+        for salt in &mut root_salts {
+            random
+                .fill(salt)
+                .map_err(|_| LogFsError::new_internal("Could not generate v3 root salt"))?;
+        }
+        let v3_crypto = crypto.as_ref().map(|_| V3Crypto::new(&log_secret));
+        let v3_root_crypto = crypto
+            .as_ref()
+            .map(|crypto| crypto.v3_root_crypto(&root_salts))
+            .transpose()?;
         let first_entry_offset = base_offset
             .checked_add(v3_entry_start)
             .ok_or_else(|| LogFsError::new_internal("Base offset overflow"))?;
         let mut s = Self {
             base_offset,
-            v3_crypto: if crypto_suite == super::V3CryptoSuite::DerivedKeys {
-                crypto.as_ref().map(|crypto| crypto.v3_crypto(identity))
-            } else {
-                None
-            },
+            v3_crypto,
+            v3_root_crypto,
             crypto,
             next_sequence: SequenceId::first(),
             offset: first_entry_offset,
@@ -216,19 +228,41 @@ impl LogWriter {
                 format: super::RootFormat::V3 {
                     identity,
                     generation: 0,
-                    last_nonce_domain: u64::from_le_bytes(identity[..8].try_into().unwrap()),
-                    crypto_suite,
+                    log_secret,
+                    root_salts,
+                    history: [0; 32],
+                    checkpoint_history: [0; 32],
                 },
             },
             actions_since_last_index_write: 0,
             tainted,
             last_written_index: None,
-            current_crypto_domain: None,
+            current_entry_nonce: None,
+            current_entry_is_checkpoint: false,
             durable,
             region_len,
         };
 
         s.create_superblocks()?;
+        if randomize_region {
+            let region_len = region_len.expect("validated bounded randomized region");
+            let remaining = region_len
+                .checked_sub(v3_entry_start)
+                .ok_or_else(|| LogFsError::new_internal("Invalid randomized region bounds"))?;
+            let random = ring::rand::SystemRandom::new();
+            let mut chunk = vec![0u8; 1024 * 1024];
+            let mut written = 0u64;
+            while written < remaining {
+                let len = usize::try_from((remaining - written).min(chunk.len() as u64))
+                    .map_err(|_| LogFsError::new_internal("Randomized region chunk overflow"))?;
+                random.fill(&mut chunk[..len]).map_err(|_| {
+                    LogFsError::new_internal("Could not randomize unused log region")
+                })?;
+                s.writer.write_all(&chunk[..len])?;
+                written += len as u64;
+            }
+            s.writer.flush()?;
+        }
         s.writer.seek(SeekFrom::Start(s.offset))?;
 
         Ok(s)
@@ -256,20 +290,25 @@ impl LogWriter {
             .ok_or_else(|| LogFsError::new_internal("Committed tail offset overflow"))?;
         file.seek(SeekFrom::Start(offset))?;
 
-        let v3_crypto = match (&crypto, &block.format) {
+        let (v3_crypto, v3_root_crypto) = match (&crypto, &block.format) {
             (
                 Some(crypto),
                 super::RootFormat::V3 {
-                    identity,
-                    crypto_suite: super::V3CryptoSuite::DerivedKeys,
+                    log_secret,
+                    root_salts,
                     ..
                 },
-            ) => Some(crypto.v3_crypto(*identity)),
-            _ => None,
+            ) => (
+                Some(V3Crypto::new(log_secret)),
+                Some(crypto.v3_root_crypto(root_salts)?),
+            ),
+            (None, super::RootFormat::V3 { .. }) => (None, None),
+            (_, super::RootFormat::LegacyV2) => (None, None),
         };
         let s = Self {
             base_offset,
             v3_crypto,
+            v3_root_crypto,
             crypto,
             next_sequence: SequenceId::from_u64(block.block.active_sequence + 1),
             offset,
@@ -283,7 +322,8 @@ impl LogWriter {
             active_superblock: block,
             tainted,
             last_written_index: None,
-            current_crypto_domain: None,
+            current_entry_nonce: None,
+            current_entry_is_checkpoint: false,
             durable,
             region_len,
         };
@@ -366,15 +406,19 @@ impl LogWriter {
             super::RootFormat::V3 {
                 identity,
                 generation,
-                last_nonce_domain,
-                crypto_suite,
+                ref log_secret,
+                root_salts,
+                history,
+                checkpoint_history,
             } => super::RootFormat::V3 {
                 identity,
                 generation: generation
                     .checked_add(1)
                     .ok_or_else(|| LogFsError::new_internal("V3 root generation exhausted"))?,
-                last_nonce_domain,
-                crypto_suite,
+                log_secret: log_secret.clone(),
+                root_salts,
+                history,
+                checkpoint_history,
             },
         };
         let block = IndexedSuperBlock {
@@ -415,7 +459,7 @@ impl LogWriter {
             debug_assert!(ptr.sequence < self.next_sequence);
         }
 
-        let buffer = match block.format {
+        let buffer = match &block.format {
             super::RootFormat::LegacyV2 => {
                 let block_size = data::Superblock::SERIALIZED_LEN - self.data_padding();
                 let mut buffer = bincode::serialize(&block.block)?;
@@ -431,89 +475,92 @@ impl LogWriter {
             super::RootFormat::V3 {
                 identity,
                 generation,
-                last_nonce_domain,
-                crypto_suite,
+                log_secret,
+                root_salts,
+                history,
+                checkpoint_history,
             } => {
-                let mut payload = bincode::serialize(&super::V3RootPayload {
+                let payload = bincode::serialize(&super::V3RootPayload {
+                    magic: super::V3_INNER_MAGIC,
+                    version: 3,
+                    profile: self.crypto().map(Crypto::profile).unwrap_or_default(),
+                    identity: *identity,
+                    slot: u8::try_from(block.index)
+                        .map_err(|_| LogFsError::new_internal("V3 root slot overflow"))?,
+                    generation: *generation,
                     block: block.block.clone(),
-                    last_nonce_domain,
+                    log_secret: **log_secret,
+                    root_salts: *root_salts,
+                    history: *history,
+                    checkpoint_history: *checkpoint_history,
                 })?;
                 let encrypted = self.crypto.is_some();
-                // Root nonces are random 96-bit values. Limiting one identity
-                // to 2^32 publications bounds the birthday-collision
-                // probability to approximately 2^-33.
-                if encrypted && generation > u32::MAX as u64 {
-                    return Err(LogFsError::new_internal(
-                        "Encrypted v3 root nonce budget exhausted",
-                    ));
-                }
-                let final_payload_len = payload.len()
-                    + if encrypted {
-                        Crypto::EXTRA_PAYLOAD_LEN
-                    } else {
-                        0
-                    };
-                let mut buffer = vec![0u8; super::V3_ROOT_RECORD_LEN];
-                buffer[..8].copy_from_slice(&super::V3_ROOT_MAGIC);
-                buffer[8..16].copy_from_slice(&super::V3_ROOT_MAGIC);
-                buffer[16] = (if encrypted {
-                    super::V3_ROOT_FLAG_ENCRYPTED
+                let clear_len = if encrypted {
+                    super::V3_ROOT_CLEAR_LEN
                 } else {
-                    0
-                }) | if crypto_suite == super::V3CryptoSuite::DerivedKeys {
-                    super::V3_ROOT_FLAG_DERIVED_KEYS
-                } else {
-                    0
+                    super::V3_ROOT_RECORD_LEN
+                        - super::V3_ROOT_OUTER_LEN
+                        - super::V3_PLAIN_METADATA_CHECKSUM_LEN
                 };
-                if crypto_suite == super::V3CryptoSuite::DerivedKeys {
-                    buffer[17] = u8::try_from(block.index)
-                        .map_err(|_| LogFsError::new_internal("V3 root slot overflow"))?;
-                }
-                buffer[20..28].copy_from_slice(&generation.to_le_bytes());
-                buffer[28..44].copy_from_slice(&identity);
-                let mut nonce = [0u8; 12];
-                if encrypted {
-                    ring::rand::SystemRandom::new()
-                        .fill(&mut nonce)
-                        .map_err(|_| {
-                            LogFsError::new_internal("Could not generate v3 root nonce")
-                        })?;
-                }
-                buffer[44..56].copy_from_slice(&nonce);
-                let final_payload_len = u32::try_from(final_payload_len)
-                    .map_err(|_| LogFsError::new_internal("V3 root payload length overflow"))?;
-                buffer[56..60].copy_from_slice(&final_payload_len.to_le_bytes());
-                if encrypted {
-                    if crypto_suite == super::V3CryptoSuite::DerivedKeys {
-                        self.v3_crypto
-                            .as_ref()
-                            .ok_or_else(|| LogFsError::new_internal("Missing derived v3 key"))?
-                            .encrypt_root(
-                                nonce,
-                                &buffer[..super::V3_ROOT_PREFIX_LEN],
-                                &mut payload,
-                            )?;
-                    } else {
-                        self.crypto()
-                            .ok_or_else(|| LogFsError::new_internal("Missing v3 encryption key"))?
-                            .encrypt_with_nonce(
-                                nonce,
-                                &buffer[..super::V3_ROOT_PREFIX_LEN],
-                                &mut payload,
-                            )?;
-                    }
-                }
-                let payload_end = super::V3_ROOT_PREFIX_LEN + payload.len();
-                let required = payload_end + if encrypted { 0 } else { 32 };
-                if required > buffer.len() {
+                let required_clear = if encrypted {
+                    60usize
+                        .checked_add(payload.len())
+                        .and_then(|length| length.checked_add(Crypto::EXTRA_PAYLOAD_LEN))
+                } else {
+                    4usize.checked_add(payload.len())
+                };
+                if required_clear.is_none_or(|required| required > clear_len) {
                     return Err(LogFsError::new_internal("V3 root payload is too large"));
                 }
-                buffer[super::V3_ROOT_PREFIX_LEN..payload_end].copy_from_slice(&payload);
+                let random = ring::rand::SystemRandom::new();
+                let mut buffer = vec![0u8; super::V3_ROOT_RECORD_LEN];
+                buffer[..super::V3_ROOT_SALT_LEN].copy_from_slice(&root_salts[block.index]);
+                let mut nonce = [0u8; super::V3_NONCE_LEN];
+                random
+                    .fill(&mut nonce)
+                    .map_err(|_| LogFsError::new_internal("Could not generate v3 root nonce"))?;
+                buffer[super::V3_ROOT_SALT_LEN..super::V3_ROOT_OUTER_LEN].copy_from_slice(&nonce);
+                let mut clear = vec![0u8; clear_len];
                 if !encrypted {
-                    let hash: [u8; 32] = sha2::Sha256::digest(&buffer[..payload_end]).into();
-                    buffer[payload_end..payload_end + 32].copy_from_slice(&hash);
+                    random.fill(&mut clear).map_err(|_| {
+                        LogFsError::new_internal("Could not randomize v3 root padding")
+                    })?;
                 }
-                buffer[super::V3_ROOT_MAGIC_COPY_OFFSET..].copy_from_slice(&super::V3_ROOT_MAGIC);
+                if encrypted {
+                    let mut inner_nonce = [0u8; 24];
+                    random.fill(&mut inner_nonce).map_err(|_| {
+                        LogFsError::new_internal("Could not generate separated v3 root nonce")
+                    })?;
+                    let mut inner = payload;
+                    self.v3_crypto
+                        .as_ref()
+                        .ok_or_else(|| LogFsError::new_internal("Missing v3 log-secret key"))?
+                        .encrypt_root(inner_nonce, &[block.index as u8], &mut inner)?;
+                    clear[..32].copy_from_slice(log_secret.as_ref());
+                    clear[32..56].copy_from_slice(&inner_nonce);
+                    clear[56..60].copy_from_slice(
+                        &u32::try_from(inner.len())
+                            .map_err(|_| LogFsError::new_internal("V3 inner root overflow"))?
+                            .to_le_bytes(),
+                    );
+                    clear[60..60 + inner.len()].copy_from_slice(&inner);
+                    self.v3_root_crypto
+                        .as_ref()
+                        .ok_or_else(|| LogFsError::new_internal("Missing v3 root key"))?
+                        .encrypt(block.index, nonce, &mut clear)?;
+                    buffer[super::V3_ROOT_OUTER_LEN..].copy_from_slice(&clear);
+                } else {
+                    clear[..4].copy_from_slice(
+                        &u32::try_from(payload.len())
+                            .map_err(|_| LogFsError::new_internal("V3 root payload overflow"))?
+                            .to_le_bytes(),
+                    );
+                    clear[4..4 + payload.len()].copy_from_slice(&payload);
+                    let clear_end = super::V3_ROOT_OUTER_LEN + clear.len();
+                    buffer[super::V3_ROOT_OUTER_LEN..clear_end].copy_from_slice(&clear);
+                    let hash: [u8; 32] = sha2::Sha256::digest(&buffer[..clear_end]).into();
+                    buffer[clear_end..].copy_from_slice(&hash);
+                }
                 buffer
             }
         };
@@ -535,62 +582,17 @@ impl LogWriter {
         Ok(())
     }
 
-    fn prepare_entry_domain(&mut self) -> Result<Option<u64>, LogFsError> {
-        let super::RootFormat::V3 {
-            identity,
-            generation,
-            last_nonce_domain,
-            crypto_suite,
-        } = self.active_superblock.format
-        else {
-            self.current_crypto_domain = None;
+    fn prepare_entry_nonce(&mut self) -> Result<Option<[u8; 24]>, LogFsError> {
+        if !matches!(self.active_superblock.format, super::RootFormat::V3 { .. }) {
+            self.current_entry_nonce = None;
             return Ok(None);
-        };
-        let domain = last_nonce_domain
-            .checked_add(1)
-            .ok_or_else(|| LogFsError::new_internal("V3 nonce domain exhausted"))?;
-        self.active_superblock.format = super::RootFormat::V3 {
-            identity,
-            generation,
-            last_nonce_domain: domain,
-            crypto_suite,
-        };
-        self.write_next_superblock()?;
-        // An encrypted nonce domain must reach stable storage before any
-        // ciphertext using it is emitted. This is part of the v3 format, not a
-        // change to the legacy flush contract.
-        if self.crypto.is_some() {
-            self.sync()?;
         }
-        self.current_crypto_domain = Some(domain);
-        Ok(Some(domain))
-    }
-
-    pub(super) fn begin_write_session(&mut self) -> Result<(), LogFsError> {
-        let super::RootFormat::V3 {
-            identity,
-            generation,
-            crypto_suite,
-            ..
-        } = self.active_superblock.format
-        else {
-            return Ok(());
-        };
-        let mut bytes = [0u8; 8];
+        let mut nonce = [0u8; 24];
         ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| LogFsError::new_internal("Could not generate v3 nonce domain"))?;
-        self.active_superblock.format = super::RootFormat::V3 {
-            identity,
-            generation,
-            last_nonce_domain: u64::from_le_bytes(bytes),
-            crypto_suite,
-        };
-        self.write_next_superblock()?;
-        if self.crypto.is_some() {
-            self.sync()?;
-        }
-        Ok(())
+            .fill(&mut nonce)
+            .map_err(|_| LogFsError::new_internal("Could not generate v3 entry nonce"))?;
+        self.current_entry_nonce = Some(nonce);
+        Ok(Some(nonce))
     }
 
     fn publish_committed_root(&mut self) -> Result<(), LogFsError> {
@@ -663,7 +665,7 @@ impl LogWriter {
     ) -> Result<PersistedEntry, LogFsError> {
         let sequence = self.next_sequence;
 
-        self.prepare_entry_domain()?;
+        self.prepare_entry_nonce()?;
 
         debug_assert_eq!(self.writer.stream_position().unwrap(), self.offset);
         let header = self.write_action(&action, incomplete)?;
@@ -696,11 +698,11 @@ impl LogWriter {
         let entry = PersistedEntry {
             entry: data::JournalEntry { header, action },
             file_data_offset: data_offset,
-            crypto_domain: self.current_crypto_domain,
+            entry_nonce: self.current_entry_nonce,
             log_identity: self.v3_identity(),
-            derived_crypto: self.v3_crypto.is_some(),
         };
-        self.current_crypto_domain = None;
+        self.current_entry_nonce = None;
+        self.current_entry_is_checkpoint = false;
 
         Ok(entry)
     }
@@ -719,21 +721,24 @@ impl LogWriter {
         let sequence = self.next_sequence;
         let entry_offset = self.offset - self.base_offset;
 
-        let mut action_data = bincode::serialize(&action)?;
-        let domain = self
-            .current_crypto_domain
-            .unwrap_or_else(|| sequence.as_u64());
+        let action_plain = bincode::serialize(&action)?;
+        let mut action_data = action_plain.clone();
         if let Some(identity) = self.v3_identity() {
-            let aad = super::v3_aad(identity, domain, ENTRY_ACTION_CHUNK);
+            let entry_nonce = self
+                .current_entry_nonce
+                .ok_or_else(|| LogFsError::new_internal("V3 entry is missing its random nonce"))?;
+            let aad = super::v3_aad(identity, entry_nonce, ENTRY_ACTION_CHUNK);
             if let Some(crypto) = self.v3_crypto.as_ref() {
-                crypto.encrypt_entry(domain, ENTRY_ACTION_CHUNK, &aad, &mut action_data)?;
-            } else if let Some(crypto) = self.crypto.as_ref() {
-                crypto.encrypt_data_with_aad(domain, ENTRY_ACTION_CHUNK, &aad, &mut action_data)?;
+                crypto.encrypt_entry(
+                    super::v3_nonce(entry_nonce, ENTRY_ACTION_CHUNK),
+                    &aad,
+                    &mut action_data,
+                )?;
             } else {
                 super::append_plain_metadata_checksum(&mut action_data, &aad);
             }
         } else if let Some(crypto) = self.crypto.as_ref() {
-            crypto.encrypt_data(domain, ENTRY_ACTION_CHUNK, &mut action_data)?;
+            crypto.encrypt_data(sequence.as_u64(), ENTRY_ACTION_CHUNK, &mut action_data)?;
         }
         let action_data_len = action_data.len();
 
@@ -749,30 +754,72 @@ impl LogWriter {
                 .map_err(|_| LogFsError::new_internal("Journal action exceeds format limit"))?,
             flags,
         };
-        let mut header_data = bincode::serialize(&header)?;
-        debug_assert_eq!(header_data.len(), data::JournalEntryHeader::SERIALIZED_LEN);
+        let mut next_history = None;
+        let mut header_data = if let Some(identity) = self.v3_identity() {
+            let entry_nonce = self
+                .current_entry_nonce
+                .ok_or_else(|| LogFsError::new_internal("V3 entry is missing its random nonce"))?;
+            let previous_history = match &self.active_superblock.format {
+                super::RootFormat::V3 { history, .. } => *history,
+                super::RootFormat::LegacyV2 => unreachable!(),
+            };
+            let history = super::v3_history_commit(
+                self.v3_crypto.as_ref(),
+                previous_history,
+                identity,
+                entry_nonce,
+                &action_plain,
+            );
+            next_history = Some((previous_history, history));
+            let encoded = bincode::serialize(&super::V3FrameHeader {
+                header: header.clone(),
+                previous_history,
+                history,
+            })?;
+            if encoded.len() + 4 > super::V3_FRAME_HEADER_CLEAR_LEN {
+                return Err(LogFsError::new_internal("V3 frame header is too large"));
+            }
+            let mut clear = vec![0u8; super::V3_FRAME_HEADER_CLEAR_LEN];
+            if self.v3_crypto.is_none() {
+                ring::rand::SystemRandom::new()
+                    .fill(&mut clear)
+                    .map_err(|_| {
+                        LogFsError::new_internal("Could not randomize v3 frame padding")
+                    })?;
+            }
+            clear[..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+            clear[4..4 + encoded.len()].copy_from_slice(&encoded);
+            clear
+        } else {
+            bincode::serialize(&header)?
+        };
         if let Some(identity) = self.v3_identity() {
-            let aad = super::v3_aad(identity, domain, ENTRY_HEADER_CHUNK);
+            let entry_nonce = self
+                .current_entry_nonce
+                .ok_or_else(|| LogFsError::new_internal("V3 entry is missing its random nonce"))?;
+            let aad = super::v3_aad(identity, entry_nonce, ENTRY_HEADER_CHUNK);
             if let Some(crypto) = self.v3_crypto.as_ref() {
-                crypto.encrypt_entry(domain, ENTRY_HEADER_CHUNK, &aad, &mut header_data)?;
-            } else if let Some(crypto) = self.crypto.as_ref() {
-                crypto.encrypt_data_with_aad(domain, ENTRY_HEADER_CHUNK, &aad, &mut header_data)?;
+                crypto.encrypt_entry(
+                    super::v3_nonce(entry_nonce, ENTRY_HEADER_CHUNK),
+                    &aad,
+                    &mut header_data,
+                )?;
             } else {
                 super::append_plain_metadata_checksum(&mut header_data, &aad);
             }
         } else if let Some(crypto) = self.crypto.as_ref() {
-            crypto.encrypt_data(domain, ENTRY_HEADER_CHUNK, &mut header_data)?;
+            crypto.encrypt_data(sequence.as_u64(), ENTRY_HEADER_CHUNK, &mut header_data)?;
         }
 
-        let domain_len = if self.current_crypto_domain.is_some() {
-            8
+        let domain_len = if self.current_entry_nonce.is_some() {
+            24
         } else {
             0
         };
         self.ensure_capacity((domain_len + header_data.len() + action_data.len()) as u64)?;
-        if let Some(domain) = self.current_crypto_domain {
+        if let Some(domain) = self.current_entry_nonce {
             maybe_fail_io(FAIL_METADATA_WRITE)?;
-            self.writer.write_all(&domain.to_le_bytes())?;
+            self.writer.write_all(&domain)?;
         } else {
             maybe_fail_io(FAIL_METADATA_WRITE)?;
         }
@@ -782,6 +829,21 @@ impl LogWriter {
         self.offset += (domain_len + header_data.len() + action_data.len()) as u64;
         debug_assert_eq!(self.writer.stream_position().unwrap(), self.offset);
         self.incomplete_entry_in_progress = true;
+        self.current_entry_is_checkpoint = action.is_index_write();
+        if let Some((previous_history, history)) = next_history {
+            let super::RootFormat::V3 {
+                history: root_history,
+                checkpoint_history,
+                ..
+            } = &mut self.active_superblock.format
+            else {
+                unreachable!();
+            };
+            if action.is_index_write() {
+                *checkpoint_history = previous_history;
+            }
+            *root_history = history;
+        }
 
         Ok(header)
     }
@@ -790,8 +852,8 @@ impl LogWriter {
         &mut self,
         action: &data::JournalAction,
     ) -> Result<data::JournalEntryHeader, LogFsError> {
-        self.prepare_entry_domain()?;
-        if self.current_crypto_domain.is_none() {
+        self.prepare_entry_nonce()?;
+        if self.current_entry_nonce.is_none() {
             return self.write_action(action, true);
         }
 
@@ -807,15 +869,17 @@ impl LogWriter {
                 .map_err(|_| LogFsError::new_internal("Streaming action is too large"))?,
             flags: data::JournalEntryHeaderFlags::empty(),
         };
-        let header_size =
-            data::JournalEntryHeader::SERIALIZED_LEN + self.metadata_padding() as usize;
-        let reserved = 8usize
+        let header_size = super::V3_FRAME_HEADER_CLEAR_LEN + self.metadata_padding() as usize;
+        let reserved = 24usize
             .checked_add(header_size)
             .and_then(|size| size.checked_add(action_size))
             .ok_or_else(|| LogFsError::new_internal("Streaming reservation overflow"))?;
-        let zeros = vec![0u8; reserved];
+        let mut random_bytes = vec![0u8; reserved];
+        ring::rand::SystemRandom::new()
+            .fill(&mut random_bytes)
+            .map_err(|_| LogFsError::new_internal("Could not randomize streaming reservation"))?;
         self.ensure_capacity(reserved as u64)?;
-        self.writer.write_all(&zeros)?;
+        self.writer.write_all(&random_bytes)?;
         self.offset += reserved as u64;
         self.incomplete_entry_in_progress = true;
         Ok(header)
@@ -873,7 +937,7 @@ impl LogWriter {
                     .map(|(key, ptr)| data::KeyIndexEntryV3 {
                         key: key.clone(),
                         sequence_id: SequenceId::from_u64(ptr.sequence_id),
-                        crypto_domain: ptr.crypto_domain,
+                        entry_nonce: ptr.entry_nonce,
                         file_offset: ptr.file_offset,
                         size: ptr.size,
                         chunk_size: ptr.chunk_size,
@@ -975,17 +1039,18 @@ impl LogWriter {
         debug_assert!(self.incomplete_entry_in_progress);
         debug_assert!(chunk >= ENTRY_FIRST_DATA_CHUNK);
 
-        let domain = self
-            .current_crypto_domain
-            .unwrap_or_else(|| self.next_sequence.as_u64());
         if let (Some(crypto), Some(identity)) = (self.v3_crypto.as_ref(), self.v3_identity()) {
-            let aad = super::v3_aad(identity, domain, chunk);
-            crypto.encrypt_entry(domain, chunk, &aad, data)?;
-        } else if let (Some(crypto), Some(identity)) = (self.crypto.as_ref(), self.v3_identity()) {
-            let aad = super::v3_aad(identity, domain, chunk);
-            crypto.encrypt_data_with_aad(domain, chunk, &aad, data)?;
+            let entry_nonce = self
+                .current_entry_nonce
+                .ok_or_else(|| LogFsError::new_internal("V3 entry is missing its random nonce"))?;
+            let aad = super::v3_aad(identity, entry_nonce, chunk);
+            if self.current_entry_is_checkpoint {
+                crypto.encrypt_checkpoint(super::v3_nonce(entry_nonce, chunk), &aad, data)?;
+            } else {
+                crypto.encrypt_entry(super::v3_nonce(entry_nonce, chunk), &aad, data)?;
+            }
         } else if let Some(crypto) = self.crypto.as_ref() {
-            crypto.encrypt_data(domain, chunk, data)?;
+            crypto.encrypt_data(self.next_sequence.as_u64(), chunk, data)?;
         }
         let len = data.len() as u64;
 
@@ -1125,9 +1190,8 @@ impl LogChunkWriter {
             size: self.data_size,
             chunk_size: Some(self.chunk_size),
             hash: Some(meta.hash.0),
-            crypto_domain: writer.current_crypto_domain,
+            entry_nonce: writer.current_entry_nonce,
             log_identity: writer.v3_identity(),
-            derived_crypto: writer.v3_crypto.is_some(),
         };
 
         writer.offset = end_offset;
@@ -1135,7 +1199,7 @@ impl LogChunkWriter {
         writer.next_sequence = writer.next_sequence.try_increment()?;
 
         writer.publish_committed_root()?;
-        writer.current_crypto_domain = None;
+        writer.current_entry_nonce = None;
 
         let mut tree = self
             .tree
@@ -1180,7 +1244,7 @@ impl LogChunkWriter {
             .map(|_| {
                 self.writer.offset = entry_offset;
                 self.writer.incomplete_entry_in_progress = false;
-                self.writer.current_crypto_domain = None;
+                self.writer.current_entry_nonce = None;
             })
             .map_err(LogFsError::from);
         if result.is_err() {

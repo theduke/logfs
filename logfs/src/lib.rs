@@ -15,7 +15,7 @@ pub use journal::{Journal2, JournalStore, Superblock};
 mod crypto;
 #[doc(hidden)]
 pub use crypto::Crypto;
-pub use crypto::CryptoConfig;
+pub use crypto::{CryptoConfig, CryptoProfile};
 #[doc(hidden)]
 pub use state::{KeyPointer, SharedTree};
 
@@ -47,6 +47,10 @@ pub struct LogOpenOptions {
     pub region_len: Option<u64>,
     /// Use ordered, synchronized root publication for each mutation.
     pub durable: bool,
+    /// On initialization, random-fill the complete owned region. This hides
+    /// unwritten capacity but requires `region_len` and performs a full-region
+    /// write. It is never applied while opening an existing log.
+    pub randomize_region: bool,
 }
 
 /// Controls optional whole-value hash checking during routine reads. Hashes are
@@ -669,9 +673,30 @@ impl<J: JournalStore> LogFs<J> {
 }
 
 impl LogFs<Journal2> {
+    /// Atomically create a new log, failing if the destination path already
+    /// exists. Opening an existing path is a separate operation, so an
+    /// authentication failure can never trigger formatting.
+    pub fn create_new(config: LogConfig) -> Result<Self, LogFsError> {
+        Self::create_new_with_options(config, LogOpenOptions::default())
+    }
+
     /// Atomically create a new durable log, failing if the destination path
     /// already exists.
-    pub fn create_new_durable(mut config: LogConfig) -> Result<Self, LogFsError> {
+    pub fn create_new_durable(config: LogConfig) -> Result<Self, LogFsError> {
+        Self::create_new_with_options(
+            config,
+            LogOpenOptions {
+                durable: true,
+                ..LogOpenOptions::default()
+            },
+        )
+    }
+
+    /// Atomically create a new log with bounded-region and durability options.
+    pub fn create_new_with_options(
+        mut config: LogConfig,
+        options: LogOpenOptions,
+    ) -> Result<Self, LogFsError> {
         tracing::debug!(?config, "creating log exclusively");
         let crypto = config
             .crypto
@@ -679,10 +704,19 @@ impl LogFs<Journal2> {
             .map(|value| Arc::new(crypto::Crypto::new(value)));
         let state = Arc::new(RwLock::new(state::State::new()));
         let path = config.path.clone();
-        let journal = Journal2::create_new_exclusive(path.clone(), state.clone(), crypto, &config)?;
-        journal.set_durable(true)?;
-        journal.sync()?;
-        sync_parent_directory(&path)?;
+        let journal = Journal2::create_new_exclusive(
+            path.clone(),
+            state.clone(),
+            crypto,
+            &config,
+            options.region_len,
+            options.randomize_region,
+        )?;
+        journal.set_durable(options.durable)?;
+        if options.durable {
+            journal.sync()?;
+            sync_parent_directory(&path)?;
+        }
         Ok(Self {
             path,
             inner: Arc::new(Inner {
@@ -747,6 +781,7 @@ impl LogFs<Journal2> {
             crypto,
             &config,
             options.region_len,
+            options.randomize_region,
         )?;
         journal.set_durable(options.durable)?;
         if options.durable {
@@ -815,6 +850,7 @@ mod tests {
                 key: "logfs".to_string().into(),
                 salt: b"salt".to_vec().into(),
                 iterations: NonZeroU32::new(1).unwrap(),
+                profile: CryptoProfile::LowMemory,
             }),
             // Set a very low chunk size to test chunking.
             default_chunk_size: 3,
@@ -934,12 +970,16 @@ mod tests {
             let expected =
                 write_legacy_v2_fixture(&config.path, crypto, b"legacy multi chunk".to_vec(), 0);
             config.allow_create = false;
+            let compatibility = LogFs::<Journal2>::open(config.clone()).unwrap();
+            assert!(matches!(
+                compatibility.insert("write", Vec::new()),
+                Err(LogFsError::ReadOnly)
+            ));
+            drop(compatibility);
+            config.readonly = true;
             let db = LogFs::<Journal2>::open(config.clone()).unwrap();
             assert_eq!(db.get("legacy").unwrap(), Some(expected));
-            db.insert("continued", b"write".to_vec()).unwrap();
             drop(db);
-            let reopened = LogFs::<Journal2>::open(config).unwrap();
-            assert_eq!(reopened.get("continued").unwrap(), Some(b"write".to_vec()));
         }
 
         let mut config = test_config("legacy-encrypted-empty-stream");
@@ -956,17 +996,9 @@ mod tests {
             "the frozen pre-v3 encrypted-empty fixture bytes changed"
         );
         config.allow_create = false;
+        config.readonly = true;
         let db = LogFs::<Journal2>::open(config.clone()).unwrap();
         assert_eq!(db.get("legacy").unwrap(), Some(expected));
-        db.insert("buffered-empty", Vec::new()).unwrap();
-        db.insert_writer("streamed-empty")
-            .unwrap()
-            .finish()
-            .unwrap();
-        drop(db);
-        let reopened = LogFs::<Journal2>::open(config).unwrap();
-        assert_eq!(reopened.get("buffered-empty").unwrap(), Some(Vec::new()));
-        assert_eq!(reopened.get("streamed-empty").unwrap(), Some(Vec::new()));
     }
 
     #[test]
@@ -976,6 +1008,7 @@ mod tests {
         let seed = vec![0x41; 8_000];
         write_legacy_v2_fixture(&config.path, None, seed.clone(), 0);
         config.allow_create = false;
+        config.readonly = true;
         let db = LogFs::<Journal2>::open(config.clone()).unwrap();
         let pointer = db
             .inner
@@ -998,43 +1031,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_unflagged_encrypted_v3_and_rejects_slot_replay_in_new_suite() {
-        let config = test_config("legacy-unflagged-v3");
-        crate::journal::v2::write::use_legacy_v3_suite_for_next_open(true);
-        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
-        db.insert("legacy-v3", b"compatible".to_vec()).unwrap();
-        drop(db);
-        let reopened = LogFs::<Journal2>::open(config.clone()).unwrap();
-        assert_eq!(
-            reopened.get("legacy-v3").unwrap(),
-            Some(b"compatible".to_vec())
-        );
-        drop(reopened);
-
-        let replay_config = test_config("v3-slot-replay");
-        let db = LogFs::<Journal2>::open(replay_config.clone()).unwrap();
-        db.insert("key", b"value".to_vec()).unwrap();
-        drop(db);
-        let bytes = std::fs::read(&replay_config.path).unwrap();
-        let generations = [
-            u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
-            u64::from_le_bytes(bytes[4096 + 20..4096 + 28].try_into().unwrap()),
-        ];
-        let older = usize::from(generations[1] < generations[0]);
-        let newer = 1 - older;
-        let old_root = bytes[older * 4096..(older + 1) * 4096].to_vec();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&replay_config.path)
-            .unwrap();
-        file.seek(std::io::SeekFrom::Start((newer * 4096) as u64))
-            .unwrap();
-        file.write_all(&old_root).unwrap();
-        drop(file);
-        assert!(LogFs::<Journal2>::open(replay_config).is_err());
-    }
-
-    #[test]
     fn exclusive_creation_preserves_existing_destination() {
         let config = test_config("exclusive-create");
         let sentinel = b"do not overwrite";
@@ -1047,7 +1043,7 @@ mod tests {
     fn exclusive_creation_supports_nonzero_offsets() {
         let mut config = test_config("exclusive-create-offset");
         config.offset = Some(37);
-        let log = LogFs::<Journal2>::create_new_durable(config.clone()).unwrap();
+        let log = LogFs::<Journal2>::create_new(config.clone()).unwrap();
         log.insert("key", b"value".to_vec()).unwrap();
         log.sync().unwrap();
         drop(log);
@@ -1060,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_legacy_history_checkpoint_and_nonzero_offset_fixture() {
+    fn legacy_nonzero_offset_fixture_is_readable_for_export() {
         let mut config = test_config("legacy-history-checkpoint-offset");
         config.offset = Some(37);
         config.full_index_write_interval = 0;
@@ -1071,34 +1067,12 @@ mod tests {
             37,
         );
         config.allow_create = false;
+        config.readonly = true;
         let db = LogFs::<Journal2>::open(config.clone()).unwrap();
-        db.rename("legacy", "renamed").unwrap();
-        db.insert("doomed", b"remove-me".to_vec()).unwrap();
-        db.remove("doomed").unwrap();
-        db.batch(Batch::new().and_rename("renamed", "final"))
-            .unwrap();
-        db.checkpoint().unwrap();
-        drop(db);
-
-        let reopened = LogFs::<Journal2>::open(config.clone()).unwrap();
-        assert_eq!(reopened.get("final").unwrap(), Some(expected));
-        assert_eq!(reopened.get("doomed").unwrap(), None);
-        let report = reopened.scrub().unwrap();
-        assert_eq!(report.keys_verified, 0);
-        assert_eq!(report.keys_unverifiable, 1);
-        drop(reopened);
-
-        let digest: [u8; 32] = sha2::Sha256::digest(std::fs::read(&config.path).unwrap()).into();
-        // Producer: the independently encoded released-v2 seed above followed
-        // by the frozen v2 rename/insert/delete/batch/checkpoint history.
-        assert_eq!(
-            digest,
-            [
-                100, 167, 49, 237, 76, 99, 68, 205, 10, 98, 18, 122, 195, 29, 150, 194, 144, 36,
-                192, 116, 159, 52, 28, 171, 118, 61, 206, 113, 0, 157, 221, 139,
-            ],
-            "update only with an intentional v2 fixture change"
-        );
+        assert_eq!(db.get("legacy").unwrap(), Some(expected));
+        let report = db.scrub().unwrap();
+        assert_eq!(report.keys_verified, 1);
+        assert_eq!(report.keys_unverifiable, 0);
     }
 
     #[test]
@@ -1460,6 +1434,7 @@ mod tests {
                 LogOpenOptions {
                     region_len: None,
                     durable: true,
+                    randomize_region: false,
                 },
             )
             .unwrap();
@@ -1494,6 +1469,7 @@ mod tests {
                 LogOpenOptions {
                     region_len: None,
                     durable: true,
+                    randomize_region: false,
                 },
             )
             .unwrap();
@@ -1541,7 +1517,7 @@ mod tests {
         config.crypto = None;
         let prefix = b"prefix";
         let suffix = b"suffix";
-        let region_len = 12_600u64;
+        let region_len = 9_000u64;
         config.offset = Some(prefix.len() as u64);
         std::fs::write(&config.path, prefix).unwrap();
         let formatted = LogFs::<Journal2>::open_with_options(
@@ -1549,6 +1525,7 @@ mod tests {
             LogOpenOptions {
                 region_len: Some(region_len),
                 durable: false,
+                randomize_region: false,
             },
         )
         .unwrap();
@@ -1562,6 +1539,7 @@ mod tests {
             LogOpenOptions {
                 region_len: Some(region_len),
                 durable: false,
+                randomize_region: false,
             },
         )
         .unwrap();
@@ -1597,12 +1575,13 @@ mod tests {
         let mut config = test_config("stream-capacity-failure");
         config.crypto = None;
         config.default_chunk_size = 32;
-        let region_len = 8_500;
+        let region_len = 9_000;
         let db = LogFs::<Journal2>::open_with_options(
             config,
             LogOpenOptions {
                 region_len: Some(region_len),
                 durable: false,
+                randomize_region: false,
             },
         )
         .unwrap();
@@ -2184,5 +2163,154 @@ mod tests {
             assert_eq!(db.get("k5").unwrap(), None);
             assert_eq!(db.get("k7").unwrap(), None);
         }
+    }
+
+    #[test]
+    fn encrypted_v3_has_opaque_roots_and_unique_nonces() {
+        let config = test_config("opaque-v3-layout");
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+        let initial_roots = std::fs::read(&config.path).unwrap();
+        db.insert("first", b"same payload".to_vec()).unwrap();
+        let second_offset = std::fs::metadata(&config.path).unwrap().len();
+        db.insert("second", b"same payload".to_vec()).unwrap();
+        drop(db);
+
+        let bytes = std::fs::read(&config.path).unwrap();
+        assert!(!bytes.windows(8).any(|window| window == b"LOGFS3R\0"));
+        assert!(
+            !bytes
+                .windows(b"LOGFS-OPAQUE-V3\0".len())
+                .any(|window| window == b"LOGFS-OPAQUE-V3\0")
+        );
+        assert!(!bytes.windows(64).any(|window| window == [0u8; 64]));
+        assert_ne!(&bytes[..16], &bytes[4096..4112]);
+        assert_ne!(&bytes[16..40], &bytes[4112..4136]);
+        assert_eq!(&initial_roots[..16], &bytes[..16]);
+        assert_eq!(&initial_roots[4096..4112], &bytes[4096..4112]);
+        assert_ne!(&initial_roots[16..40], &bytes[16..40]);
+        assert_ne!(&initial_roots[4112..4136], &bytes[4112..4136]);
+        assert_ne!(
+            &bytes[crate::journal::v2::V3_HEADER_SIZE as usize
+                ..crate::journal::v2::V3_HEADER_SIZE as usize + 24],
+            &bytes[second_offset as usize..second_offset as usize + 24]
+        );
+    }
+
+    #[test]
+    fn wrong_v3_profile_or_key_never_formats_the_file() {
+        let config = test_config("wrong-v3-profile-key");
+        let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+        db.insert("key", b"value".to_vec()).unwrap();
+        drop(db);
+        let original = std::fs::read(&config.path).unwrap();
+
+        let mut wrong_profile = config.clone();
+        wrong_profile.crypto.as_mut().unwrap().profile = CryptoProfile::Standard;
+        assert!(LogFs::<Journal2>::open(wrong_profile).is_err());
+        assert_eq!(std::fs::read(&config.path).unwrap(), original);
+
+        let mut wrong_key = config;
+        wrong_key.crypto.as_mut().unwrap().key = "wrong".to_owned().into();
+        assert!(LogFs::<Journal2>::open(wrong_key.clone()).is_err());
+        assert_eq!(std::fs::read(&wrong_key.path).unwrap(), original);
+    }
+
+    #[test]
+    fn root_slot_substitution_is_rejected() {
+        let first = test_config("root-substitution-a");
+        let mut second = first.clone();
+        second.path = temp_test_dir("root-substitution-b");
+        drop(LogFs::<Journal2>::open(first.clone()).unwrap());
+        drop(LogFs::<Journal2>::open(second.clone()).unwrap());
+        let donor = std::fs::read(&second.path).unwrap();
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&first.path)
+            .unwrap();
+        target.write_all(&donor[..4096]).unwrap();
+        drop(target);
+        assert!(LogFs::<Journal2>::open(first).is_err());
+    }
+
+    #[test]
+    fn sibling_history_splices_are_rejected_with_and_without_checkpoint() {
+        for checkpoint in [false, true] {
+            let suffix = if checkpoint { "checkpoint" } else { "scan" };
+            let first = test_config(&format!("history-splice-a-{suffix}"));
+            let mut second = first.clone();
+            second.path = temp_test_dir(&format!("history-splice-b-{suffix}"));
+            let db = LogFs::<Journal2>::open(first.clone()).unwrap();
+            db.insert("seed", b"seed".to_vec()).unwrap();
+            if checkpoint {
+                db.checkpoint().unwrap();
+            }
+            drop(db);
+            std::fs::copy(&first.path, &second.path).unwrap();
+            let branch_offset = std::fs::metadata(&first.path).unwrap().len();
+
+            let first_db = LogFs::<Journal2>::open(first.clone()).unwrap();
+            first_db.insert("branch", b"aaaaaaaa".to_vec()).unwrap();
+            drop(first_db);
+            let second_db = LogFs::<Journal2>::open(second.clone()).unwrap();
+            second_db.insert("branch", b"bbbbbbbb".to_vec()).unwrap();
+            drop(second_db);
+
+            let donor = std::fs::read(&second.path).unwrap();
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&first.path)
+                .unwrap();
+            target
+                .seek(std::io::SeekFrom::Start(branch_offset))
+                .unwrap();
+            target.write_all(&donor[branch_offset as usize..]).unwrap();
+            drop(target);
+            assert!(LogFs::<Journal2>::open(first).is_err());
+        }
+    }
+
+    #[test]
+    fn randomized_bounded_initialization_fills_only_the_owned_region() {
+        let mut config = test_config("randomized-region");
+        config.crypto = None;
+        let region_len = 16 * 1024;
+        let db = LogFs::<Journal2>::create_new_with_options(
+            config.clone(),
+            LogOpenOptions {
+                region_len: Some(region_len),
+                durable: false,
+                randomize_region: true,
+            },
+        )
+        .unwrap();
+        drop(db);
+        let bytes = std::fs::read(&config.path).unwrap();
+        assert_eq!(bytes.len(), region_len as usize);
+        assert!(
+            !bytes[crate::journal::v2::V3_HEADER_SIZE as usize..]
+                .windows(64)
+                .any(|window| window == [0u8; 64])
+        );
+
+        config.allow_create = false;
+        LogFs::<Journal2>::open_with_options(
+            config,
+            LogOpenOptions {
+                region_len: Some(region_len),
+                durable: false,
+                randomize_region: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn obsolete_development_v3_is_not_opened_or_reformatted() {
+        let config = test_config("obsolete-v3-no-fallback");
+        let mut bytes = vec![0x5a; crate::journal::v2::V3_HEADER_SIZE as usize];
+        bytes[..8].copy_from_slice(b"LOGFS3R\0");
+        std::fs::write(&config.path, &bytes).unwrap();
+        assert!(LogFs::<Journal2>::open(config.clone()).is_err());
+        assert_eq!(std::fs::read(config.path).unwrap(), bytes);
     }
 }
