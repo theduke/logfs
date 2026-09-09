@@ -7,3 +7,4 @@ pub use self::{
     provider::LogFsProvider,
     store::LogFsObjStore,
 };
+pub use logfs::CryptoProfile;

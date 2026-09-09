@@ -38,8 +38,8 @@ impl LogFsObjStore {
     pub const KIND: &'static str = "objstore.logfs";
 
     pub fn new(config: LogFsObjStoreConfig) -> Result<Self> {
-        let log_config = config.to_logfs_config();
         let open_options = config.to_logfs_open_options()?;
+        let log_config = config.to_logfs_config();
         let log = LogFs::open_with_options(log_config, open_options).map_err(map_logfs_err)?;
         let safe_uri = config.safe_uri()?;
 
@@ -479,9 +479,10 @@ mod tests {
     async fn test_logfs_store() {
         let dir = tempfile::tempdir().unwrap();
         let crypto = crate::LogFsCryptoConfig {
-            key: "hello123".to_string(),
-            salt: b"saltysalt".to_vec(),
-            iterations: NonZeroU32::new(1).unwrap(),
+            key: Some("hello123".to_string()),
+            salt: Some(b"saltysalt".to_vec()),
+            iterations: NonZeroU32::new(1),
+            profile: logfs::CryptoProfile::LowMemory,
         };
         let path = dir.path().join("store.log");
         std::fs::write(&path, [0x5a; 127]).unwrap();

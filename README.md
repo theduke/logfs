@@ -108,6 +108,17 @@ and block-device URIs default to read-only; the explicit `create` flag permits
 initialization and writes. `allow_create=true` remains available as a verbose
 alias.
 
+Encrypted v3 URI configuration accepts only `key` and `profile`; both are
+optional, and `profile` accepts `standard` (the default) or `low-memory`. A
+caller can parse a URL without its secret and populate `LogFsCryptoConfig::key`
+before opening the store. Safe URIs omit `key` while retaining `profile`. Legacy
+v2 `salt` and `iterations` are programmatic configuration fields and are
+required when an encrypted `version=2` log is selected. For example:
+
+```text
+logfs:///absolute/path/to/archive.log?version=3&key=secret&profile=standard
+```
+
 ## Performance harness
 
 `cargo bench -p logfs --bench reliability --locked` covers 10,000 small writes,

@@ -1,7 +1,8 @@
 use std::{num::NonZeroU32, path::PathBuf};
 
-use base64::Engine as _;
-use logfs::{ConfigBuilder, CryptoConfig, LogConfig, LogFormatVersion, LogOpenOptions};
+use logfs::{
+    ConfigBuilder, CryptoConfig, CryptoProfile, LogConfig, LogFormatVersion, LogOpenOptions,
+};
 use objstore::{ObjStoreError, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -9,19 +10,50 @@ use zeroize::Zeroizing;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct LogFsCryptoConfig {
-    pub key: String,
-    #[serde(with = "serde_bytes")]
-    pub salt: Vec<u8>,
-    pub iterations: NonZeroU32,
+    /// Encryption password. This may be populated after parsing a URL so the
+    /// secret does not need to be embedded in it.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Legacy-v2 PBKDF2 salt. V3 reads its random salts from the root slots.
+    #[serde(default, with = "serde_bytes")]
+    pub salt: Option<Vec<u8>>,
+    /// Legacy-v2 PBKDF2 iteration count. V3 uses `profile` instead.
+    #[serde(default)]
+    pub iterations: Option<NonZeroU32>,
+    /// Out-of-band Argon2id profile used for encrypted v3 roots.
+    #[serde(default)]
+    pub profile: CryptoProfile,
 }
 
 impl LogFsCryptoConfig {
-    pub fn into_crypto(self) -> CryptoConfig {
-        CryptoConfig {
-            key: Zeroizing::new(self.key),
-            salt: Zeroizing::new(self.salt),
-            iterations: self.iterations,
-            profile: Default::default(),
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: Some(key.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn into_crypto(self) -> Option<CryptoConfig> {
+        let key = self.key?;
+        Some(CryptoConfig {
+            key: Zeroizing::new(key),
+            // The core compatibility config still has required legacy fields.
+            // These placeholders are unreachable for explicitly selected v2;
+            // v3 ignores them and reads independently generated salts on disk.
+            salt: Zeroizing::new(self.salt.unwrap_or_default()),
+            iterations: self.iterations.unwrap_or(NonZeroU32::MIN),
+            profile: self.profile,
+        })
+    }
+}
+
+impl Default for LogFsCryptoConfig {
+    fn default() -> Self {
+        Self {
+            key: None,
+            salt: None,
+            iterations: None,
+            profile: CryptoProfile::default(),
         }
     }
 }
@@ -108,7 +140,9 @@ impl LogFsObjStoreConfig {
             builder = builder.allow_create();
         }
         if let Some(ref crypto) = self.crypto {
-            builder = builder.crypto(crypto.clone().into_crypto());
+            if let Some(crypto) = crypto.clone().into_crypto() {
+                builder = builder.crypto(crypto);
+            }
         }
         if let Some(chunk_size) = self.default_chunk_size {
             builder = builder.default_chunk_size(chunk_size);
@@ -127,6 +161,24 @@ impl LogFsObjStoreConfig {
     }
 
     pub(crate) fn to_logfs_open_options(&self) -> Result<LogOpenOptions> {
+        if self.crypto.as_ref().is_some_and(|crypto| {
+            crypto.key.is_none() && (crypto.salt.is_some() || crypto.iterations.is_some())
+        }) {
+            return Err(ObjStoreError::InvalidConfig {
+                message: "crypto salt and iterations require a key".to_string(),
+                source: None,
+            });
+        }
+        if self.version == Some(2)
+            && self.crypto.as_ref().is_some_and(|crypto| {
+                crypto.key.is_some() && (crypto.salt.is_none() || crypto.iterations.is_none())
+            })
+        {
+            return Err(ObjStoreError::InvalidConfig {
+                message: "encrypted v2 requires salt and iterations".to_string(),
+                source: None,
+            });
+        }
         let format_version = match self.version {
             None => None,
             Some(2) => Some(LogFormatVersion::V2),
@@ -178,13 +230,16 @@ impl LogFsObjStoreConfig {
             message: "failed to parse logfs safe URI".to_string(),
             source: Some(source.into()),
         })?;
-        if self.version.is_some() || self.offset.is_some() {
+        if self.version.is_some() || self.offset.is_some() || self.crypto.is_some() {
             let mut query = url.query_pairs_mut();
             if let Some(version) = self.version {
                 query.append_pair("version", &version.to_string());
             }
             if let Some(offset) = self.offset {
                 query.append_pair("offset", &offset.to_string());
+            }
+            if let Some(crypto) = &self.crypto {
+                query.append_pair("profile", crypto_profile_name(crypto.profile));
             }
         }
         Ok(url)
@@ -224,8 +279,7 @@ impl LogFsObjStoreConfig {
 
         let mut config = Self::new(path);
         let mut crypto_key: Option<String> = None;
-        let mut crypto_salt: Option<Vec<u8>> = None;
-        let mut crypto_iterations: Option<NonZeroU32> = None;
+        let mut crypto_profile: Option<CryptoProfile> = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "version" => {
@@ -280,37 +334,11 @@ impl LogFsObjStoreConfig {
                             }
                         })?)
                 }
-                "crypto_key" => {
+                "key" => {
                     crypto_key = Some(value.to_string());
                 }
-                "crypto_salt_b64" | "crypto_salt" => {
-                    let engine = base64::engine::general_purpose::STANDARD;
-                    let decoded = engine.decode(value.as_ref()).map_err(|source| {
-                        ObjStoreError::InvalidConfig {
-                            message: format!(
-                                "invalid base64 salt '{value}': expected valid base64"
-                            ),
-                            source: Some(source.into()),
-                        }
-                    })?;
-                    crypto_salt = Some(decoded);
-                }
-                "crypto_iterations" => {
-                    let parsed =
-                        value
-                            .parse::<u32>()
-                            .map_err(|source| ObjStoreError::InvalidConfig {
-                                message: format!(
-                                    "invalid crypto iterations '{value}': expected u32"
-                                ),
-                                source: Some(source.into()),
-                            })?;
-                    crypto_iterations = Some(NonZeroU32::new(parsed).ok_or_else(|| {
-                        ObjStoreError::InvalidConfig {
-                            message: format!("crypto iterations must be non-zero: '{}'", value),
-                            source: None,
-                        }
-                    })?);
+                "profile" => {
+                    crypto_profile = Some(parse_crypto_profile(&value)?);
                 }
                 other => {
                     return Err(ObjStoreError::InvalidConfig {
@@ -324,28 +352,36 @@ impl LogFsObjStoreConfig {
             }
         }
 
-        config.to_logfs_open_options()?;
-
-        match (crypto_key, crypto_salt, crypto_iterations) {
-            (None, None, None) => {}
-            (Some(key), Some(salt), Some(iterations)) => {
-                config.crypto = Some(LogFsCryptoConfig {
-                    key,
-                    salt,
-                    iterations,
-                });
-            }
-            _ => {
-                return Err(ObjStoreError::InvalidConfig {
-                    message:
-                        "invalid crypto configuration: expected crypto_key, crypto_salt, and crypto_iterations"
-                            .to_string(),
-                    source: None,
-                });
-            }
+        if crypto_key.is_some() || crypto_profile.is_some() {
+            config.crypto = Some(LogFsCryptoConfig {
+                key: crypto_key,
+                profile: crypto_profile.unwrap_or_default(),
+                ..LogFsCryptoConfig::default()
+            });
         }
 
+        config.to_logfs_open_options()?;
         Ok(config)
+    }
+}
+
+fn parse_crypto_profile(value: &str) -> Result<CryptoProfile> {
+    match value {
+        "standard" => Ok(CryptoProfile::Standard),
+        "low-memory" | "low_memory" => Ok(CryptoProfile::LowMemory),
+        _ => Err(ObjStoreError::InvalidConfig {
+            message: format!(
+                "invalid crypto profile '{value}': expected 'standard' or 'low-memory'"
+            ),
+            source: None,
+        }),
+    }
+}
+
+fn crypto_profile_name(profile: CryptoProfile) -> &'static str {
+    match profile {
+        CryptoProfile::Standard => "standard",
+        CryptoProfile::LowMemory => "low-memory",
     }
 }
 
@@ -400,6 +436,73 @@ mod tests {
 
         let unsupported = Url::parse("logfs:///tmp/archive.log?version=1").unwrap();
         assert!(LogFsObjStoreConfig::from_url(&unsupported).is_err());
+    }
+
+    #[test]
+    fn v3_crypto_url_uses_optional_key_and_profile() {
+        let standard = LogFsObjStoreConfig::from_url(
+            &Url::parse("logfs:///tmp/archive.log?version=3&key=secret").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            standard.safe_uri().unwrap().as_str(),
+            "logfs:///tmp/archive.log?version=3&profile=standard"
+        );
+        let crypto = standard.crypto.unwrap();
+        assert_eq!(crypto.key.as_deref(), Some("secret"));
+        assert_eq!(crypto.salt, None);
+        assert_eq!(crypto.iterations, None);
+        assert_eq!(crypto.profile, CryptoProfile::Standard);
+
+        let mut deferred = LogFsObjStoreConfig::from_url(
+            &Url::parse("logfs:///tmp/archive.log?version=3&profile=low-memory").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            deferred.safe_uri().unwrap().as_str(),
+            "logfs:///tmp/archive.log?version=3&profile=low-memory"
+        );
+        let crypto = deferred.crypto.as_mut().unwrap();
+        assert_eq!(crypto.key, None);
+        assert_eq!(crypto.profile, CryptoProfile::LowMemory);
+        crypto.key = Some("injected-secret".to_string());
+
+        let logfs_crypto = deferred.to_logfs_config().crypto.unwrap();
+        assert_eq!(logfs_crypto.profile, CryptoProfile::LowMemory);
+    }
+
+    #[test]
+    fn encrypted_v2_requires_programmatic_legacy_parameters() {
+        let missing = Url::parse("logfs:///tmp/archive.log?version=2&key=secret").unwrap();
+        assert!(LogFsObjStoreConfig::from_url(&missing).is_err());
+
+        let mut config = LogFsObjStoreConfig::from_url(
+            &Url::parse("logfs:///tmp/archive.log?version=2").unwrap(),
+        )
+        .unwrap();
+        config.crypto = Some(LogFsCryptoConfig {
+            key: Some("secret".to_string()),
+            salt: Some(b"legacy-salt".to_vec()),
+            iterations: NonZeroU32::new(100_000),
+            profile: CryptoProfile::Standard,
+        });
+        assert!(config.to_logfs_open_options().is_ok());
+    }
+
+    #[test]
+    fn url_rejects_noncanonical_crypto_parameters() {
+        for query in [
+            "crypto_key=secret",
+            "crypto_profile=standard",
+            "salt=c2FsdA==",
+            "iterations=100000",
+        ] {
+            let url = Url::parse(&format!("logfs:///tmp/archive.log?{query}")).unwrap();
+            assert!(LogFsObjStoreConfig::from_url(&url).is_err(), "{query}");
+        }
+
+        let invalid = Url::parse("logfs:///tmp/archive.log?profile=fast").unwrap();
+        assert!(LogFsObjStoreConfig::from_url(&invalid).is_err());
     }
 
     #[test]

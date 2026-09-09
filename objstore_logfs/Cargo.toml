@@ -19,11 +19,10 @@ objstore = "0.1.0-alpha.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_bytes = "0.11"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 url = "2"
 
 logfs = { path = "../logfs", version = "0.2" }
-base64 = "0.23"
 zeroize = "1"
 
 # time crate used for filling in timestamps when backend doesn't provide them
