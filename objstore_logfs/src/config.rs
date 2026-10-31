@@ -66,6 +66,8 @@ pub struct LogFsObjStoreConfig {
     pub version: Option<u32>,
     #[serde(default)]
     pub allow_create: bool,
+    /// Use raw storage and permit writes without requiring creation permission.
+    /// Explicit read-only mode still takes precedence.
     #[serde(default)]
     pub raw_mode: bool,
     /// Permit formatting non-zeroed data when creating a raw log.
@@ -213,7 +215,7 @@ impl LogFsObjStoreConfig {
     }
 
     fn requires_create_for_writes(&self) -> bool {
-        self.offset.is_some() || path_is_block_device(&self.path)
+        !self.raw_mode && (self.offset.is_some() || path_is_block_device(&self.path))
     }
 
     pub fn safe_uri(&self) -> Result<Url> {

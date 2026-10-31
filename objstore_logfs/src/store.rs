@@ -486,12 +486,17 @@ mod tests {
         };
         let path = dir.path().join("store.log");
         std::fs::write(&path, [0x5a; 127]).unwrap();
-        let config = LogFsObjStoreConfig::new(path)
+        let config = LogFsObjStoreConfig::new(path.clone())
             .with_version(3)
             .with_offset(127)
             .with_allow_create(true)
             .with_crypto(crypto);
-        let store = LogFsObjStore::new(config).unwrap();
+        assert!(
+            LogFsObjStore::new(config.clone().with_raw_mode(true).with_allow_create(false))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), [0x5a; 127]);
+        let store = LogFsObjStore::new(config.clone()).unwrap();
 
         store.healthcheck().await.unwrap();
         let meta = store
@@ -501,11 +506,28 @@ mod tests {
         assert_eq!(meta.size, Some(5));
         assert_eq!(store.get("dir/key").await.unwrap().unwrap(), b"hello"[..]);
 
+        drop(store);
+        let mut reopen_config = config;
+        reopen_config.raw_mode = true;
+        reopen_config.allow_create = false;
+        let store = LogFsObjStore::new(reopen_config.clone()).unwrap();
+        assert_eq!(store.get("dir/key").await.unwrap().unwrap(), b"hello"[..]);
         store.send_copy(Copy::new("dir/key", "copy")).await.unwrap();
         let keys = store.list_keys(ListArgs::new()).await.unwrap();
         assert_eq!(keys.items, ["copy", "dir/key"]);
 
         store.delete("dir/key").await.unwrap();
         assert!(store.get("dir/key").await.unwrap().is_none());
+        drop(store);
+
+        reopen_config.readonly = true;
+        let store = LogFsObjStore::new(reopen_config).unwrap();
+        assert_eq!(store.get("copy").await.unwrap().unwrap(), b"hello"[..]);
+        assert!(
+            store
+                .send_put(Put::new("copy", Bytes::from_static(b"changed")))
+                .await
+                .is_err()
+        );
     }
 }

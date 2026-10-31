@@ -109,9 +109,10 @@ logfs:///absolute/path/to/archive.log?version=3&offset=4096&create
 `version` may be `2` or `3` when opening an existing log; new logs can only be
 created as version 3. If `version` is omitted, the format is auto-detected.
 `offset` selects the start of the LogFS region within the backing file. Offset
-and block-device URIs default to read-only; the explicit `create` flag permits
-initialization and writes. `allow_create=true` remains available as a verbose
-alias.
+and block-device URIs default to read-only; either `raw=true` or the explicit
+`create` flag permits writes. Only `create` permits initialization of a new log.
+`readonly=true` always disables writes. `allow_create=true` remains available as
+a verbose alias.
 
 Encrypted v3 URI configuration accepts only `key` and `profile`; both are
 optional, and `profile` accepts `standard` (the default) or `low-memory`. A
