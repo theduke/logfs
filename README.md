@@ -65,15 +65,20 @@ call `finish()` so errors are observable.
 
 For raw devices or files containing other data, `LogFs::open_with_options` can
 bound the log to `region_len` bytes beginning at `LogConfig::offset`. Writes are
-checked incrementally and bytes outside the region are not modified. Formatting
-an existing region is only performed when the backing file ends exactly at the
-configured offset and `allow_create` is enabled. Setting
+checked incrementally and bytes outside the region are not modified. For
+ordinary file-backed regions, formatting is only performed when the backing
+file ends exactly at the configured offset and `allow_create` is enabled. Setting
 `LogOpenOptions::randomize_region` during initialization writes random bytes to
 all otherwise-unused capacity in the bounded region; it requires `region_len`
 and is rejected for existing logs. Ordinary growing encrypted files avoid
 fixed markers and reserved zero gaps, but still reveal total size and growth
 timing. Randomized bounded regions hide unused capacity at the cost of a
 full-region initialization write.
+
+The object-store URI's `raw=true&create=true` initializes an unrecognized raw
+region automatically only when its first 10 MiB are zero. Non-zero or smaller
+regions require the explicit `force-create=true` option. Valid existing logs
+continue to open normally when `create=true` is present.
 
 Whole-value hashes are always generated and stored for new values. Routine reads
 skip hash checking by default for throughput; use

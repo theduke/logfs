@@ -55,6 +55,9 @@ pub struct LogOpenOptions {
     /// Require an existing log to use this on-disk format. New logs currently
     /// support only [`LogFormatVersion::V3`].
     pub format_version: Option<LogFormatVersion>,
+    /// Permit initializing unrecognized raw data when raw creation is enabled.
+    /// This may format non-zeroed data and should be used with care.
+    pub force_create_raw: bool,
 }
 
 /// Controls optional whole-value hash checking during routine reads. Hashes are
@@ -1460,6 +1463,7 @@ mod tests {
                     durable: true,
                     randomize_region: false,
                     format_version: None,
+                    force_create_raw: false,
                 },
             )
             .unwrap();
@@ -1496,6 +1500,7 @@ mod tests {
                     durable: true,
                     randomize_region: false,
                     format_version: None,
+                    force_create_raw: false,
                 },
             )
             .unwrap();
@@ -1553,6 +1558,7 @@ mod tests {
                 durable: false,
                 randomize_region: false,
                 format_version: None,
+                force_create_raw: false,
             },
         )
         .unwrap();
@@ -1568,6 +1574,7 @@ mod tests {
                 durable: false,
                 randomize_region: false,
                 format_version: None,
+                force_create_raw: false,
             },
         )
         .unwrap();
@@ -1611,6 +1618,7 @@ mod tests {
                 durable: false,
                 randomize_region: false,
                 format_version: None,
+                force_create_raw: false,
             },
         )
         .unwrap();
@@ -2310,6 +2318,7 @@ mod tests {
                 durable: false,
                 randomize_region: true,
                 format_version: None,
+                force_create_raw: false,
             },
         )
         .unwrap();
@@ -2330,6 +2339,7 @@ mod tests {
                 durable: false,
                 randomize_region: false,
                 format_version: None,
+                force_create_raw: false,
             },
         )
         .unwrap();

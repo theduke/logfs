@@ -23,7 +23,7 @@ pub mod write;
 
 use std::{
     collections::BTreeMap,
-    io::{self, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
     sync::{Arc, Mutex},
 };
 
@@ -346,16 +346,59 @@ impl Journal2 {
                     ));
                 }
                 let mut state = tree.write().unwrap();
-
-                Self::open_existing(
-                    file,
-                    &mut state,
-                    &crypto,
-                    config.offset.unwrap_or_default(),
-                    &tainted,
-                    durable.clone(),
-                    options,
-                )?
+                if config.raw_mode && config.allow_create {
+                    let existing_file = file.try_clone()?;
+                    match Self::open_existing(
+                        existing_file,
+                        &mut state,
+                        &crypto,
+                        config.offset.unwrap_or_default(),
+                        &tainted,
+                        durable.clone(),
+                        options,
+                    ) {
+                        Ok(writer) => writer,
+                        Err(error @ (LogFsError::Internal { .. } | LogFsError::Conversion(_))) => {
+                            // Preserve valid existing logs. Only initialize an
+                            // unrecognized raw region automatically when its
+                            // first 10 MiB are zero; otherwise require the
+                            // explicit force-create override.
+                            if !options.force_create_raw
+                                && !Self::is_zeroed_raw_prefix(
+                                    &mut file,
+                                    config.offset.unwrap_or_default(),
+                                )?
+                            {
+                                return Err(LogFsError::new_internal(
+                                    "raw creation requires the first 10 MiB to be zeroed; force-create=true is required to format non-zeroed raw data",
+                                ));
+                            }
+                            tracing::debug!(?error, "initializing unrecognized raw log region");
+                            *state = crate::state::State::new();
+                            file.seek(SeekFrom::Start(config.offset.unwrap_or_default()))?;
+                            LogWriter::create_new(
+                                crypto.clone(),
+                                tainted.clone(),
+                                file,
+                                config.offset.unwrap_or_default(),
+                                durable.clone(),
+                                options.region_len,
+                                options.randomize_region,
+                            )?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    Self::open_existing(
+                        file,
+                        &mut state,
+                        &crypto,
+                        config.offset.unwrap_or_default(),
+                        &tainted,
+                        durable.clone(),
+                        options,
+                    )?
+                }
             }
         } else {
             if !config.allow_create || config.readonly {
@@ -415,6 +458,35 @@ impl Journal2 {
         };
 
         Ok(j)
+    }
+
+    fn is_zeroed_raw_prefix(
+        file: &mut std::fs::File,
+        base_offset: u64,
+    ) -> Result<bool, LogFsError> {
+        const CHECK_LEN: usize = 10 * 1024 * 1024;
+        const CHUNK_LEN: usize = 64 * 1024;
+
+        let result = (|| {
+            file.seek(SeekFrom::Start(base_offset))?;
+            let mut remaining = CHECK_LEN;
+            let mut chunk = vec![0; CHUNK_LEN];
+            while remaining > 0 {
+                let len = remaining.min(chunk.len());
+                match file.read_exact(&mut chunk[..len]) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+                    Err(error) => return Err(LogFsError::from(error)),
+                }
+                if chunk[..len].iter().any(|byte| *byte != 0) {
+                    return Ok(false);
+                }
+                remaining -= len;
+            }
+            Ok(true)
+        })();
+        file.seek(SeekFrom::Start(base_offset))?;
+        result
     }
 
     fn open_existing(

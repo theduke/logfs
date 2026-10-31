@@ -21,6 +21,55 @@ fn config(dir: &tempfile::TempDir, name: &str, encrypted: bool) -> LogConfig {
     config
 }
 
+#[test]
+fn raw_mode_create_initializes_a_preallocated_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw-device.img");
+    let capacity = 12 * 1024 * 1024;
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(capacity)
+        .unwrap();
+    let mut config = ConfigBuilder::new(&path).raw_mode().allow_create().build();
+    config.full_index_write_interval = 0;
+
+    let db = LogFs::<Journal2>::open(config.clone()).unwrap();
+    db.insert("item", b"raw contents".to_vec()).unwrap();
+    drop(db);
+
+    let db = LogFs::<Journal2>::open(config).unwrap();
+    assert_eq!(db.get("item").unwrap(), Some(b"raw contents".to_vec()));
+}
+
+#[test]
+fn raw_mode_create_requires_force_for_nonzero_region() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw-device.img");
+    let capacity = 12 * 1024 * 1024;
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(capacity).unwrap();
+    drop(file);
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.seek(SeekFrom::Start(32)).unwrap();
+    file.write_all(&[1]).unwrap();
+    drop(file);
+    let bytes = std::fs::read(&path).unwrap();
+    let config = ConfigBuilder::new(&path).raw_mode().allow_create().build();
+
+    assert!(LogFs::<Journal2>::open(config.clone()).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    let options = LogOpenOptions {
+        force_create_raw: true,
+        ..LogOpenOptions::default()
+    };
+    let db = LogFs::<Journal2>::open_with_options(config.clone(), options).unwrap();
+    db.insert("item", b"raw contents".to_vec()).unwrap();
+    drop(db);
+    let db = LogFs::<Journal2>::open_with_options(config, options).unwrap();
+    assert_eq!(db.get("item").unwrap(), Some(b"raw contents".to_vec()));
+}
+
 fn repair(config: LogConfig, destination: Option<std::path::PathBuf>) -> Result<(), LogFsError> {
     LogFs::<Journal2>::repair(
         config,

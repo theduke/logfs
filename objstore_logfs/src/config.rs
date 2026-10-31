@@ -68,6 +68,9 @@ pub struct LogFsObjStoreConfig {
     pub allow_create: bool,
     #[serde(default)]
     pub raw_mode: bool,
+    /// Permit formatting non-zeroed data when creating a raw log.
+    #[serde(default)]
+    pub force_create_raw: bool,
     pub offset: Option<u64>,
     #[serde(default)]
     pub readonly: bool,
@@ -86,6 +89,7 @@ impl LogFsObjStoreConfig {
             version: None,
             allow_create: false,
             raw_mode: false,
+            force_create_raw: false,
             offset: None,
             readonly: false,
             default_chunk_size: None,
@@ -117,6 +121,11 @@ impl LogFsObjStoreConfig {
 
     pub fn with_raw_mode(mut self, raw: bool) -> Self {
         self.raw_mode = raw;
+        self
+    }
+
+    pub fn with_force_create_raw(mut self, force: bool) -> Self {
+        self.force_create_raw = force;
         self
     }
 
@@ -161,6 +170,12 @@ impl LogFsObjStoreConfig {
     }
 
     pub(crate) fn to_logfs_open_options(&self) -> Result<LogOpenOptions> {
+        if self.force_create_raw && (!self.raw_mode || !self.allow_create) {
+            return Err(ObjStoreError::InvalidConfig {
+                message: "force-create requires raw=true and create=true".to_string(),
+                source: None,
+            });
+        }
         if self.crypto.as_ref().is_some_and(|crypto| {
             crypto.key.is_none() && (crypto.salt.is_some() || crypto.iterations.is_some())
         }) {
@@ -192,6 +207,7 @@ impl LogFsObjStoreConfig {
         };
         Ok(LogOpenOptions {
             format_version,
+            force_create_raw: self.force_create_raw,
             ..LogOpenOptions::default()
         })
     }
@@ -246,6 +262,36 @@ impl LogFsObjStoreConfig {
     }
 
     pub fn from_url(url: &Url) -> Result<Self> {
+        let pairs: Vec<_> = url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        let mut force_create = false;
+        let mut config_url = url.clone();
+        {
+            let mut query = config_url.query_pairs_mut();
+            query.clear();
+            for (key, value) in &pairs {
+                if key == "force-create" || key == "force_create" {
+                    force_create = parse_bool(value)?;
+                } else {
+                    query.append_pair(key, value);
+                }
+            }
+        }
+        let mut config = Self::from_url_without_force_create(&config_url)?;
+        if force_create && (!config.raw_mode || !config.allow_create) {
+            return Err(ObjStoreError::InvalidConfig {
+                message: "force-create requires raw=true and create=true".to_string(),
+                source: None,
+            });
+        }
+        config.force_create_raw = force_create;
+        config.to_logfs_open_options()?;
+        Ok(config)
+    }
+
+    fn from_url_without_force_create(url: &Url) -> Result<Self> {
         if url.scheme() != Self::URI_SCHEME {
             return Err(ObjStoreError::InvalidConfig {
                 message: format!(
