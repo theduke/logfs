@@ -342,14 +342,7 @@ impl LogFsObjStoreConfig {
                 "allow_create" => config.allow_create = parse_bool(&value)?,
                 "readonly" => config.readonly = parse_bool(&value)?,
                 "raw" | "raw_mode" => config.raw_mode = parse_bool(&value)?,
-                "offset" => {
-                    config.offset = Some(value.parse::<u64>().map_err(|source| {
-                        ObjStoreError::InvalidConfig {
-                            message: format!("invalid offset '{value}': expected u64"),
-                            source: Some(source.into()),
-                        }
-                    })?)
-                }
+                "offset" => config.offset = Some(parse_offset(&value)?),
                 "chunk_size" | "default_chunk_size" => {
                     config.default_chunk_size = Some(value.parse::<u32>().map_err(|source| {
                         ObjStoreError::InvalidConfig {
@@ -445,6 +438,36 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+fn parse_offset(value: &str) -> Result<u64> {
+    let digits_end = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, suffix) = value.split_at(digits_end);
+    let multiplier = match suffix.to_ascii_lowercase().as_str() {
+        "" => 1,
+        "g" | "gb" => 1_000_000_000,
+        "m" | "mb" => 1_000_000,
+        _ => {
+            return Err(ObjStoreError::InvalidConfig {
+                message: format!("invalid offset '{value}': expected bytes, M, MB, G, or GB"),
+                source: None,
+            });
+        }
+    };
+    let bytes = digits
+        .parse::<u64>()
+        .map_err(|source| ObjStoreError::InvalidConfig {
+            message: format!("invalid offset '{value}': expected a non-negative integer"),
+            source: Some(source.into()),
+        })?;
+    bytes
+        .checked_mul(multiplier)
+        .ok_or_else(|| ObjStoreError::InvalidConfig {
+            message: format!("invalid offset '{value}': value is too large"),
+            source: None,
+        })
+}
+
 fn path_is_block_device(path: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
@@ -463,6 +486,19 @@ fn path_is_block_device(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offset_parser_accepts_decimal_size_suffixes() {
+        for (value, expected) in [
+            ("123", 123),
+            ("2g", 2_000_000_000),
+            ("2GB", 2_000_000_000),
+            ("3m", 3_000_000),
+            ("3Mb", 3_000_000),
+        ] {
+            assert_eq!(parse_offset(value).unwrap(), expected);
+        }
+    }
 
     #[test]
     fn uri_selectors_round_trip() {
